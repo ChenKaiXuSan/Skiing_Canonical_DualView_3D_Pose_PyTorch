@@ -1,0 +1,27 @@
+name: canonical_dualview_3d_pose
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-lightning
+  - scikit-learn
+  - hydra-core        # 对应 hydra
+  - einops            # SAM 3D Body 常用
+  - timm              # SAM 3D Body 常用
+  - pip:
+    # 核心 SAM 3D Body 及其专有依赖
+    - git+https://github.com/facebookresearch/sam-3d-body.git
+    - git+https://github.com/facebookresearch/detectron2.git
+    - pyrender        # 用于 3D 人体渲染
+    - roma            # 3D 旋转库
+    - pyrootutils
+    # - -r requirements.txt # 继续保留你的本地 requirements 链接
