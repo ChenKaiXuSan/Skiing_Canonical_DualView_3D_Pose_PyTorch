@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 '''
-File: /workspace/MultiView_DriverAction_PyTorch/project/dataloader/__init__.py
-Project: /workspace/MultiView_DriverAction_PyTorch/project/dataloader
-Created Date: Saturday January 24th 2026
+File: /workspace/code/sam3d_body/__init__.py
+Project: /workspace/code/sam3d_body
+Created Date: Thursday December 4th 2025
 Author: Kaixu Chen
 -----
 Comment:
 
 Have a good code time :)
 -----
-Last Modified: Saturday January 24th 2026 10:51:04 pm
+Last Modified: Thursday December 4th 2025 10:10:01 pm
 Modified By: the developer formerly known as Kaixu Chen at <chenkaixusan@gmail.com>
 -----
-Copyright (c) 2026 The University of Tsukuba
+Copyright (c) 2025 The University of Tsukuba
 -----
 HISTORY:
 Date      	By	Comments

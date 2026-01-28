@@ -1,8 +1,24 @@
 {
 	"folders": [
 		{
-			"name": "skeleton",
-			"path": "/workspace/project"
+			"name": "code",
+			"path": "/workspace/Skiing_Canonical_DualView_3D_Pose_PyTorch"
 		},
+		{
+			"name": "data",
+			"path": "/workspace/data"
+		},
+		{
+			"name": "reference",
+			"path": "/workspace/code"
+		},
+		{
+			"name": "Drive_Face_Mesh_PyTorch",
+			"path": "/workspace/Drive_Face_Mesh_PyTorch"
+		},
+		{
+			"name": "MultiView_DriverAction_PyTorch",
+			"path": "/workspace/MultiView_DriverAction_PyTorch"
+		}
 	]
 }

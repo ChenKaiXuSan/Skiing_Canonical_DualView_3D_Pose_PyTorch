@@ -1,56 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
-'''
-File: /workspace/deep-learning-project-template/project/main.py
-Project: /workspace/deep-learning-project-template/project
-Created Date: Friday November 29th 2024
+"""
+File: /workspace/code/project/main.py
+Project: /workspace/code/project
+Created Date: Tuesday April 22nd 2025
 Author: Kaixu Chen
 -----
 Comment:
 
 Have a good code time :)
 -----
-Last Modified: Friday November 29th 2024 12:51:51 pm
+Last Modified: Thursday May 1st 2025 8:34:05 pm
 Modified By: the developer formerly known as Kaixu Chen at <chenkaixusan@gmail.com>
 -----
-Copyright (c) 2024 The University of Tsukuba
+Copyright (c) 2025 The University of Tsukuba
 -----
 HISTORY:
 Date      	By	Comments
 ----------	---	---------------------------------------------------------
-'''
-"""
-File: main.py
-Project: project
-Created Date: 2023-10-19 02:29:35
-Author: chenkaixu
------
-Comment:
- 
-Have a good code time!
------
-Last Modified: Thursday October 19th 2023 2:29:35 am
-Modified By: the developer formerly known as Kaixu Chen at <chenkaixusan@gmail.com>
------
-HISTORY:
-Date 	By 	Comments
-------------------------------------------------
-
-26-11-2024	Kaixu Chen	refactor the code, now run script in python -m project.main
-
-26-11-2024	Kaixu Chen	add attention branch network (ATN) for compare experiment.
-
-23-09-2024	Kaixu Chen	add compare experiment, phasemix with different backbone, like 3dcnn, 2dcnn, cnn_lstm.
-
-25-06-2024	Kaixu Chen	Splitting the backbone and temporal mix was used for more detailed comparison tests
-
-07-06-2024	Kaixu Chen	add two stream compare experiment.
-
-14-05-2024	Kaixu Chen	1. move the train process inside the new folder "trainer" and select based on "experiment" keyword.
-                        2. add the save helper to save the inference results. deplucate the save_inference code in the main.py.
-04-04-2024	Kaixu Chen	add save inference method. now it can save the pred/label to the disk, for the further analysis.
-2023-10-29	KX.C	add the lr monitor, and fast dev run to trainer.
-
 """
 
 import os
@@ -59,35 +26,34 @@ import hydra
 from omegaconf import DictConfig
 
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 from pytorch_lightning.callbacks import (
     TQDMProgressBar,
     RichModelSummary,
     ModelCheckpoint,
     EarlyStopping,
     LearningRateMonitor,
+    DeviceStatsMonitor,
 )
 
-from project.dataloader.data_loader import WalkDataModule
+from project.dataloader.data_loader import DriverDataModule
 
 #####################################
-# select different experiment trainer 
+# select different experiment trainer
 #####################################
 
-# 3D CNN model
-from project.trainer.train_single import SingleModule
-from project.trainer.train_late_fusion import LateFusionModule
-from project.trainer.train_temporal_mix import TemporalMixModule
-# compare experiment
-from project.trainer.train_two_stream import TwoStreamModule
-from project.trainer.train_cnn_lstm import CNNLstmModule
-from project.trainer.train_cnn import CNNModule
-# Attention Branch Network
-from project.trainer.train_backbone_atn import BackboneATNModule
+# baseline
+from project.trainer.baseline.train_3dcnn import Res3DCNNTrainer
 
+# attention based
+from project.trainer.mid.train_pose_attn import PoseAttnTrainer
+from project.trainer.mid.train_se_attn import SEAttnTrainer
+from project.trainer.early.train_early_fusion import EarlyFusion3DCNNTrainer
+from project.trainer.late.train_late_fusion import LateFusion3DCNNTrainer
 
 from project.cross_validation import DefineCrossValidation
-from project.helper import save_helper
+
+logger = logging.getLogger(__name__)
 
 
 def train(hparams: DictConfig, dataset_idx, fold: int):
@@ -105,57 +71,58 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
     seed_everything(42, workers=True)
 
     # * select experiment
-    if hparams.train.backbone == "3dcnn":
-        # * ablation study 2: different training strategy
-        if "late_fusion" in hparams.train.experiment:
-            classification_module = LateFusionModule(hparams)
-        elif "single" in hparams.train.experiment:
-            classification_module = SingleModule(hparams)
-        elif hparams.train.temporal_mix:
-            classification_module = TemporalMixModule(hparams)
+    # TODO: add more experiment trainer here.
+    if hparams.train.view == "multi":
+        if hparams.model.backbone == "3dcnn":
+
+            if hparams.model.fuse_method in ["add", "mul", "concat", "avg"]:
+                classification_module = EarlyFusion3DCNNTrainer(hparams)
+            elif hparams.model.fuse_method == "late":
+                classification_module = LateFusion3DCNNTrainer(hparams)
+            else:
+                raise ValueError("the experiment fuse method is not supported.")
         else:
-            raise ValueError(f"the {hparams.train.experiment} is not supported.")
-    elif hparams.train.backbone == "3dcnn_atn":
-        classification_module = BackboneATNModule(hparams)
-    # * compare experiment
-    elif hparams.train.backbone == "two_stream":
-        classification_module = TwoStreamModule(hparams)
-    # * compare experiment
-    elif hparams.train.backbone == "cnn_lstm":
-        classification_module = CNNLstmModule(hparams)
-    # * compare experiment
-    elif hparams.train.backbone == "2dcnn":
-        classification_module = CNNModule(hparams)
-
+            raise ValueError("the experiment backbone is not supported.")
+    elif hparams.train.view == "single":
+        classification_module = Res3DCNNTrainer(hparams)
     else:
-        raise ValueError("the experiment backbone is not supported.")
+        raise ValueError("the experiment view is not supported.")
 
-    data_module = WalkDataModule(hparams, dataset_idx)
+    # * prepare data module
+    data_module = DriverDataModule(hparams, dataset_idx)
 
     # for the tensorboard
     tb_logger = TensorBoardLogger(
-        save_dir=os.path.join(hparams.train.log_path),
-        name=str(fold),  # here should be str type.
+        save_dir=os.path.join(hparams.log_path, "tb_logs"),
+        name="fold_" + str(fold),  # here should be str type.
+    )
+
+    cvs_logger = CSVLogger(
+        save_dir=os.path.join(hparams.log_path, "csv_logs"),
+        name="fold_" + str(fold) + "_csv",  # here should be str type.
     )
 
     # some callbacks
-    progress_bar = TQDMProgressBar(refresh_rate=100)
+    progress_bar = TQDMProgressBar(refresh_rate=10)
     rich_model_summary = RichModelSummary(max_depth=2)
 
     # define the checkpoint becavier.
     model_check_point = ModelCheckpoint(
+        dirpath=os.path.join(
+            hparams.log_path, "checkpoints", "fold_" + str(fold)
+        ),
         filename="{epoch}-{val/loss:.2f}-{val/video_acc:.4f}",
         auto_insert_metric_name=False,
         monitor="val/video_acc",
         mode="max",
-        save_last=False,
+        save_last=True,
         save_top_k=2,
     )
 
     # define the early stop.
     early_stopping = EarlyStopping(
         monitor="val/video_acc",
-        patience=3,
+        patience=5,
         mode="max",
     )
 
@@ -163,51 +130,38 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
 
     trainer = Trainer(
         devices=[
-            int(hparams.train.gpu_num),
+            int(hparams.train.gpu),
         ],
         accelerator="gpu",
         max_epochs=hparams.train.max_epochs,
-        # limit_train_batches=2,
-        # limit_val_batches=2,
-        logger=tb_logger,  # wandb_logger,
+        logger=[tb_logger],
         check_val_every_n_epoch=1,
         callbacks=[
-            progress_bar,
+            # progress_bar,
             rich_model_summary,
             model_check_point,
             early_stopping,
             lr_monitor,
+            DeviceStatsMonitor(),  # monitor the device stats.
         ],
-        fast_dev_run=hparams.train.fast_dev_run,  # if use fast dev run for debug.
+        # limit_train_batches=2,
+        # limit_val_batches=2,
+        # limit_test_batches=2,
     )
 
-    # trainer.fit(classification_module, data_module)
+    trainer.fit(classification_module, data_module)
 
-    # the validate method will wirte in the same log twice, so use the test method.
+    # save the metrics to file
     trainer.test(
         classification_module,
         data_module,
-        # ckpt_path="best",
+        ckpt_path="best",
     )
-
-    # TODO: the save helper for 3dnn_atn not implemented yet.
-    if hparams.train.backbone == "3dcnn_atn":
-        pass
-    else:
-        # save_helper(hparams, classification_module, data_module, fold) #! debug only
-        save_helper(
-            hparams,
-            classification_module.load_from_checkpoint(
-                trainer.checkpoint_callback.best_model_path
-            ),
-            data_module,
-            fold,
-        )
 
 
 @hydra.main(
     version_base=None,
-    config_path="../configs", # * the config_path is relative to location of the python script
+    config_path="../configs",  # * the config_path is relative to location of the python script
     config_name="config.yaml",
 )
 def init_params(config):
@@ -217,9 +171,9 @@ def init_params(config):
 
     fold_dataset_idx = DefineCrossValidation(config)()
 
-    logging.info("#" * 50)
-    logging.info("Start train all fold")
-    logging.info("#" * 50)
+    logger.info("#" * 50)
+    logger.info("Start train all fold")
+    logger.info("#" * 50)
 
     #########
     # K fold
@@ -227,22 +181,21 @@ def init_params(config):
     # * for one fold, we first train/val model, then save the best ckpt preds/label into .pt file.
 
     for fold, dataset_value in fold_dataset_idx.items():
-        logging.info("#" * 50)
-        logging.info("Start train fold: {}".format(fold))
-        logging.info("#" * 50)
+        logger.info("#" * 50)
+        logger.info(f"Start train fold: {fold}")
+        logger.info("#" * 50)
 
         train(config, dataset_value, fold)
 
-        logging.info("#" * 50)
-        logging.info("finish train fold: {}".format(fold))
-        logging.info("#" * 50)
+        logger.info("#" * 50)
+        logger.info(f"finish train fold: {fold}")
+        logger.info("#" * 50)
 
-    logging.info("#" * 50)
-    logging.info("finish train all fold")
-    logging.info("#" * 50)
+    logger.info("#" * 50)
+    logger.info("finish train all fold")
+    logger.info("#" * 50)
 
 
 if __name__ == "__main__":
-
     os.environ["HYDRA_FULL_ERROR"] = "1"
     init_params()
