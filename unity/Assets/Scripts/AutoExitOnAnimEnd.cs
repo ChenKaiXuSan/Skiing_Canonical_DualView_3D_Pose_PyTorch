@@ -14,19 +14,10 @@ public class AutoExitOnAnimEnd : MonoBehaviour
     public string stateName = "";
 
     [Header("Behavior")]
-    public bool stopTimeScaleOnFinish = false;  // 可选：结束后冻结画面
-    public bool exitPlayModeInEditor = true;    // 编辑器模式：自动退出Play
-    public bool quitAppInBuild = false;         // 打包运行：自动退出程序
-    public int extraFramesAfterFinish = 0;      // 播完后再多录N帧（避免最后一帧没写到）
-
-    [Header("Recorder Finalize")]
-    [Tooltip("结束前主动调用 PoseRecorder.Close()，确保数据落盘")]
-    public bool closePoseRecordersBeforeExit = true;
-
-    [Tooltip("自动查找场景里的 PoseRecorder")]
-    public bool autoFindPoseRecorders = true;
-
-    public PoseRecorder[] poseRecorders;
+    public bool stopTimeScaleOnFinish = false;
+    public bool exitPlayModeInEditor = true;
+    public bool quitAppInBuild = false;
+    public int extraFramesAfterFinish = 0;
 
     [Header("Wait Capture")]
     [Tooltip("退出前等待场景内 OneCameraCaptureFrame 全部完成")]
@@ -37,15 +28,13 @@ public class AutoExitOnAnimEnd : MonoBehaviour
 
     public OneCameraCaptureFrame[] captureFrames;
 
-    bool finished = false;
-    int extraCount = 0;
-    int targetHash = 0;
-    bool recorderClosed = false;
+    bool finished;
+    int extraCount;
+    int targetHash;
 
     void Start()
     {
-        if (animator == null)
-            animator = GetComponentInChildren<Animator>();
+        animator ??= GetComponentInChildren<Animator>();
 
         if (animator == null)
         {
@@ -57,11 +46,7 @@ public class AutoExitOnAnimEnd : MonoBehaviour
         if (!string.IsNullOrEmpty(stateName))
             targetHash = Animator.StringToHash(stateName);
 
-        if (autoFindPoseRecorders)
-            poseRecorders = FindObjectsOfType<PoseRecorder>(true);
-
-        if (autoFindCaptureFrames)
-            captureFrames = FindObjectsOfType<OneCameraCaptureFrame>(true);
+        RefreshCaptureFrames();
     }
 
     void Update()
@@ -69,12 +54,9 @@ public class AutoExitOnAnimEnd : MonoBehaviour
         if (finished) return;
 
         var st = animator.GetCurrentAnimatorStateInfo(layer);
-
-        // 如果指定了 stateName，就只在该 state 播完时退出
         if (targetHash != 0 && st.shortNameHash != targetHash)
             return;
 
-        // normalizedTime >= 1 表示至少播完一次；同时确保不在 transition 中
         if (st.normalizedTime >= 1.0f && !animator.IsInTransition(layer))
         {
             finished = true;
@@ -87,7 +69,6 @@ public class AutoExitOnAnimEnd : MonoBehaviour
 
     void LateUpdate()
     {
-        // 用 LateUpdate 计 extraFrames，保证你的 kpt recorder 也在同一帧完成写入
         if (!finished) return;
 
         if (extraCount > 0)
@@ -104,8 +85,6 @@ public class AutoExitOnAnimEnd : MonoBehaviour
 
     void ExitNow()
     {
-        CloseRecordersIfNeeded();
-
 #if UNITY_EDITOR
         if (exitPlayModeInEditor)
         {
@@ -121,29 +100,10 @@ public class AutoExitOnAnimEnd : MonoBehaviour
         }
     }
 
-    void CloseRecordersIfNeeded()
-    {
-        if (!closePoseRecordersBeforeExit || recorderClosed) return;
-
-        if (poseRecorders == null || poseRecorders.Length == 0)
-            poseRecorders = FindObjectsOfType<PoseRecorder>(true);
-
-        for (int i = 0; i < poseRecorders.Length; i++)
-        {
-            if (poseRecorders[i] == null) continue;
-            poseRecorders[i].Close();
-        }
-
-        recorderClosed = true;
-    }
-
     bool AreAllCapturesDone()
     {
         if (captureFrames == null || captureFrames.Length == 0)
-        {
-            if (autoFindCaptureFrames)
-                captureFrames = FindObjectsOfType<OneCameraCaptureFrame>(true);
-        }
+            RefreshCaptureFrames();
 
         if (captureFrames == null || captureFrames.Length == 0)
             return true;
@@ -159,5 +119,11 @@ public class AutoExitOnAnimEnd : MonoBehaviour
         }
 
         return true;
+    }
+
+    void RefreshCaptureFrames()
+    {
+        if (!autoFindCaptureFrames) return;
+        captureFrames = FindObjectsOfType<OneCameraCaptureFrame>(true);
     }
 }

@@ -7201,9 +7201,6 @@ PrefabInstance:
     m_AddedComponents:
     - targetCorrespondingSourceObject: {fileID: 919132149155446097, guid: e1a6cc7340f64714892d83c0e23f028b, type: 3}
       insertIndex: -1
-      addedObject: {fileID: 2030730310}
-    - targetCorrespondingSourceObject: {fileID: 919132149155446097, guid: e1a6cc7340f64714892d83c0e23f028b, type: 3}
-      insertIndex: -1
       addedObject: {fileID: 2030730312}
   m_SourcePrefab: {fileID: 100100000, guid: e1a6cc7340f64714892d83c0e23f028b, type: 3}
 --- !u!4 &1822871699 stripped
@@ -7958,31 +7955,6 @@ Animator:
   m_CorrespondingSourceObject: {fileID: 5866666021909216657, guid: e1a6cc7340f64714892d83c0e23f028b, type: 3}
   m_PrefabInstance: {fileID: 1822871698}
   m_PrefabAsset: {fileID: 0}
---- !u!114 &2030730310
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 2030730307}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 6bf5f17124c2c7545888184d055850bd, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  autoScanFromMesh: 1
-  rootBone: {fileID: 781862816}
-  joints: []
-  animator: {fileID: 2030730308}
-  animatorLayer: 0
-  poseEveryNFrames: 1
-  outRootFolder: SkiDataset
-  subjectId: male
-  actionId: A001
-  kpt3dFileName: kpt3d_poseRecorder.npy
-  exportJsonl: 0
-  jsonlFileName: pose3d.jsonl
-  recordOnPlay: 1
 --- !u!114 &2030730312
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -8002,9 +7974,6 @@ MonoBehaviour:
   exitPlayModeInEditor: 1
   quitAppInBuild: 0
   extraFramesAfterFinish: 0
-  closePoseRecordersBeforeExit: 1
-  autoFindPoseRecorders: 1
-  poseRecorders: []
   waitAllCapturesDone: 1
   autoFindCaptureFrames: 1
   captureFrames: []
