@@ -41,7 +41,6 @@ namespace PoseRecord.Data
     {
         public string subject_id;
         public string action_id;
-        public string take_id;
         public string camera_id;
         public int total_frames;
         public int sampled_frames;
@@ -76,16 +75,15 @@ namespace PoseRecord.Data
     public class DatasetManifestData
     {
         public string updated_at_utc;
-        public List<DatasetTakeEntry> takes = new List<DatasetTakeEntry>();
+        public List<DatasetActionEntry> actions = new List<DatasetActionEntry>();
     }
 
     [Serializable]
-    public class DatasetTakeEntry
+    public class DatasetActionEntry
     {
         public string subject_id;
         public string action_id;
-        public string take_id;
-        public string take_path;
+        public string action_path;
         public int camera_count;
         public string[] camera_ids;
     }
@@ -93,12 +91,30 @@ namespace PoseRecord.Data
 
 public class OneCameraCaptureFrame : MonoBehaviour
 {
+    struct ClipSegment
+    {
+        public AnimationClip clip;
+        public int startFrame;
+        public int frameCount;
+    }
+
+    class ActionCaptureState
+    {
+        public string actionName;
+        public string imageFolder;
+        public string kpt2dFolder;
+        public List<float> kpt2dBuffer;
+        public int sampledFrames;
+    }
+
     [Header("Output")]
     public string outRootFolder = "SkiDataset";
     public string subjectId = "S001";
     public string actionId = "A001";
-    public string takeId = "take_0001";
     public string cameraId = "";
+
+    [Tooltip("使用动作名（首个采样 clip 名）作为 actions 下的目录名")]
+    public bool useClipNameAsActionFolder = true;
 
     [Header("Output Naming")]
     [Tooltip("帧目录名前缀，例如 capture_L0_A000")]
@@ -120,10 +136,23 @@ public class OneCameraCaptureFrame : MonoBehaviour
     public Animator targetAnimator;     // Animator（可选）
 
     [Tooltip("每隔多少个 Unity 帧采一次姿态")]
-    public int poseEveryNFrames = 10;
+    public int poseEveryNFrames = 1;
+
+    [Tooltip("强制每帧采样（忽略 poseEveryNFrames，推荐开启）")]
+    public bool forceEveryFrame = true;
 
     [Tooltip("Animator layer index")]
     public int animatorLayer = 0;
+
+    [Header("Animation Sampling")]
+    [Tooltip("按 Controller 内全部动作顺序采样并计算 total_frames（而不是只采当前动作）")]
+    public bool sampleAllControllerClips = true;
+
+    [Tooltip("打印 Controller 动作明细与总长度")]
+    public bool logControllerClipSummary = true;
+
+    [Tooltip("按动作（clip）拆分输出目录（建议关闭：frames/kpt2d 仅按相机分）")]
+    public bool splitOutputByClip = false;
 
     [Header("Joints")]
     [Tooltip("是否自动扫描 rootBone 下的骨骼")]
@@ -161,6 +190,10 @@ public class OneCameraCaptureFrame : MonoBehaviour
 
     [Tooltip("同时导出 3D 关键点 npz（与 npy 并存）")]
     public bool exportKpt3dNpz = false;
+
+    // 新增：每帧单独导出 kpt2d npy
+    [Tooltip("每帧单独导出 2D 关键点 npy 到 kpt2d 文件夹")]
+    public bool exportKpt2dPerFrame = true;
 
     // session
     private float baseTime;
@@ -237,21 +270,28 @@ public class OneCameraCaptureFrame : MonoBehaviour
             yield break;
         }
 
-        int totalFrames = 0;
+        targetAnimator.enabled = true;
+        targetAnimator.Update(0f);
 
-        // 遍历 Animator 中引用的所有动画片段
-        foreach (AnimationClip clip in ac.animationClips)
+        AnimationClip captureClip = null;
+        var currentClips = targetAnimator.GetCurrentAnimatorClipInfo(animatorLayer);
+        if (currentClips != null && currentClips.Length > 0)
+            captureClip = currentClips[0].clip;
+        if (captureClip == null && ac.animationClips != null && ac.animationClips.Length > 0)
+            captureClip = ac.animationClips[0];
+
+        if (captureClip == null)
         {
-            // clip.length 是秒数
-            // clip.frameRate 是该动画制作时的采样率（通常是 30 或 60）
-            // 使用 Mathf.RoundToInt 确保浮点数转换精确
-            int frames = Mathf.RoundToInt(clip.length * clip.frameRate);
-            totalFrames += frames;
-
-            Debug.Log($"动画: {clip.name} | 时长: {clip.length}s | 帧率: {clip.frameRate} | 帧数: {frames}");
+            Debug.LogError("[OneCameraCaptureFrame] no valid AnimationClip found for sampling.");
+            yield break;
         }
 
-        Debug.Log($"<color=yellow>所有动画的总帧数: {totalFrames}</color>");
+        var controllerClips = GetUniqueControllerClips(ac);
+        var clipSegments = BuildClipSegments(sampleAllControllerClips ? controllerClips : new List<AnimationClip> { captureClip });
+
+        int totalFrames = GetTotalFramesFromSegments(clipSegments);
+        if (logControllerClipSummary)
+            LogClipSegmentsSummary(clipSegments, sampleAllControllerClips ? "ControllerAllClips" : "CurrentClipOnly");
 
         if (totalFrames <= 0)
         {
@@ -259,39 +299,45 @@ public class OneCameraCaptureFrame : MonoBehaviour
             yield break;
         }
 
+        string resolvedActionName = ResolveActionFolderName(captureClip);
+
         baseTime = Time.time;
-        yield return StartCoroutine(CaptureSequence(totalFrames));
+        yield return StartCoroutine(CaptureSequence(totalFrames, clipSegments, resolvedActionName));
 
         IsCaptureDone = true;
 
         // 结束之后退出
     }
 
-    IEnumerator CaptureSequence(int totalFrames)
+    IEnumerator CaptureSequence(int totalFrames, List<ClipSegment> clipSegments, string actionFolderName)
     {
         string root = Path.Combine(Application.dataPath, "..", outRootFolder);
-        string takeRoot = Path.Combine(root, "subjects", subjectId, "actions", actionId, "takes", takeId);
-        string metaFolder = Path.Combine(takeRoot, "meta");
-        string cameraFolder = Path.Combine(takeRoot, "cameras", cameraId);
+        string actionRoot = Path.Combine(root, actionFolderName);
+        string metaFolder = Path.Combine(actionRoot, "meta");
+        string cameraFolder = Path.Combine(actionRoot, "cameras", cameraId);
 
         // 使用 captureFolderPrefix 生成帧目录名
         string captureFolderName = string.IsNullOrWhiteSpace(captureFolderPrefix)
             ? cameraId
             : $"{captureFolderPrefix}_{cameraId}";
 
-        string frameRoot = Path.Combine(takeRoot, "frames", captureFolderName);
-        string imageFolder = Path.Combine(frameRoot, "images");
+        string frameRoot = Path.Combine(actionRoot, "frames", captureFolderName);
+        string imageFolder = frameRoot;
+        string kpt2dRoot = Path.Combine(actionRoot, "kpt2d");
+        string safeCameraIdForKpt2d = string.IsNullOrWhiteSpace(cameraId) ? "cam_unknown" : cameraId;
+        string kpt2dCameraRoot = Path.Combine(kpt2dRoot, safeCameraIdForKpt2d);
 
         // 使用 kptPrefix 生成 2D 关键点文件名
         string kpt2dFileName = string.IsNullOrWhiteSpace(kptPrefix) ? "kpt2d.npy" : $"{kptPrefix}.npy";
-        string kpt2dPath = Path.Combine(frameRoot, kpt2dFileName);
+        string kpt2dPath = Path.Combine(kpt2dCameraRoot, kpt2dFileName);
 
-        string kpt3dFolder = Path.Combine(takeRoot, "kpt3d");
+        string kpt3dFolder = Path.Combine(actionRoot, "kpt3d");
         string kpt3dPath = Path.Combine(kpt3dFolder, "kpt3d.npy");
 
         Directory.CreateDirectory(metaFolder);
         Directory.CreateDirectory(cameraFolder);
         Directory.CreateDirectory(imageFolder);
+        Directory.CreateDirectory(kpt2dCameraRoot);
         Directory.CreateDirectory(kpt3dFolder);
 
         Debug.Log($"[OneCameraCaptureFrame] Output camera folder: {frameRoot}");
@@ -301,7 +347,9 @@ public class OneCameraCaptureFrame : MonoBehaviour
         rt.Create();
         tex = new Texture2D(captureWidth, captureHeight, TextureFormat.RGBA32, false);
 
-        WriteSequenceMeta(Path.Combine(metaFolder, "sequence.json"), totalFrames, 0);
+        int stride = forceEveryFrame ? 1 : Mathf.Max(1, poseEveryNFrames);
+
+        WriteSequenceMeta(Path.Combine(metaFolder, "sequence.json"), actionFolderName, totalFrames, 0, stride);
         WriteCameraIntrinsics(Path.Combine(cameraFolder, "intrinsics.json"));
         WriteCameraExtrinsics(Path.Combine(cameraFolder, "extrinsics.json"));
 
@@ -313,42 +361,163 @@ public class OneCameraCaptureFrame : MonoBehaviour
             rec.joints2d.Add(new PoseRecord.Data.Joint2DData { name = j.name });
 
         float oldSpeed = targetAnimator ? targetAnimator.speed : 1f;
+        bool oldEnabled = targetAnimator ? targetAnimator.enabled : false;
 
-        int stride = Mathf.Max(1, poseEveryNFrames);
         int expectedSamples = Mathf.CeilToInt(totalFrames / (float)stride);
+        if ((totalFrames - 1) % stride != 0) expectedSamples += 1; // 额外包含最后一帧
         var kpt2dBuffer = new List<float>(expectedSamples * joints.Length * 3);
         var kpt3dBuffer = new List<float>(expectedSamples * joints.Length * 3);
         bool shouldWrite3d = exportSharedKpt3d && (overwriteExistingKpt3d || !File.Exists(kpt3dPath));
+        bool splitByClip = false; // 强制：frames/kpt2d 不再按动作开子目录
+        var actionStates = new Dictionary<string, ActionCaptureState>();
 
         int outputFrameIdx = 0;
 
         for (int sampleIdx = 0; sampleIdx < totalFrames; sampleIdx += stride)
         {
-            if (targetAnimator)
-                FreezeAnimatorAtSample(sampleIdx, totalFrames);
+            if (targetAnimator && clipSegments != null && clipSegments.Count > 0)
+                FreezeAnimatorAtSample(clipSegments, sampleIdx, totalFrames);
+
+            int localFrame;
+            var seg = GetSegmentAtFrame(clipSegments, sampleIdx, totalFrames, out localFrame);
+            string actionName = (seg.clip != null && !string.IsNullOrWhiteSpace(seg.clip.name)) ? seg.clip.name : actionId;
+            string safeActionName = MakeSafePathName(actionName);
+
+            string currentImageFolder = splitByClip
+                ? Path.Combine(frameRoot, safeActionName)
+                : imageFolder;
+
+            string currentKpt2dFolder = splitByClip
+                ? Path.Combine(kpt2dCameraRoot, safeActionName)
+                : kpt2dCameraRoot;
+
+            List<float> currentKpt2dBuffer = kpt2dBuffer;
+            if (splitByClip)
+            {
+                if (!actionStates.TryGetValue(safeActionName, out var state))
+                {
+                    state = new ActionCaptureState
+                    {
+                        actionName = safeActionName,
+                        imageFolder = currentImageFolder,
+                        kpt2dFolder = currentKpt2dFolder,
+                        kpt2dBuffer = new List<float>(expectedSamples * joints.Length * 3),
+                        sampledFrames = 0
+                    };
+                    actionStates.Add(safeActionName, state);
+                }
+                currentKpt2dBuffer = state.kpt2dBuffer;
+            }
 
             // 传入 imagePrefix
-            yield return StartCoroutine(CaptureSingleFrame(sampleIdx, outputFrameIdx, imageFolder, imagePrefix, rec, kpt2dBuffer));
+            yield return StartCoroutine(CaptureSingleFrame(
+                sampleIdx,
+                splitByClip ? (actionStates[safeActionName].sampledFrames) : outputFrameIdx,
+                currentImageFolder,
+                imagePrefix,
+                currentKpt2dFolder,
+                kptPrefix,       // 新增
+                rec,
+                currentKpt2dBuffer
+            ));
+
+            if (splitByClip)
+                actionStates[safeActionName].sampledFrames++;
 
             if (shouldWrite3d)
                 AppendKpt3DWorldTJC3(kpt3dBuffer);
 
-            if (targetAnimator)
-                targetAnimator.enabled = true;
+            outputFrameIdx++;
+        }
+
+        int lastFrameIdx = Mathf.Max(0, totalFrames - 1);
+        bool lastFrameAlreadyCaptured = (lastFrameIdx % stride == 0);
+        if (!lastFrameAlreadyCaptured)
+        {
+            if (targetAnimator && clipSegments != null && clipSegments.Count > 0)
+                FreezeAnimatorAtSample(clipSegments, lastFrameIdx, totalFrames);
+
+            int localFrame;
+            var seg = GetSegmentAtFrame(clipSegments, lastFrameIdx, totalFrames, out localFrame);
+            string actionName = (seg.clip != null && !string.IsNullOrWhiteSpace(seg.clip.name)) ? seg.clip.name : actionId;
+            string safeActionName = MakeSafePathName(actionName);
+
+            string currentImageFolder = splitByClip
+                ? Path.Combine(frameRoot, safeActionName)
+                : imageFolder;
+
+            string currentKpt2dFolder = splitByClip
+                ? Path.Combine(kpt2dCameraRoot, safeActionName)
+                : kpt2dCameraRoot;
+
+            List<float> currentKpt2dBuffer = kpt2dBuffer;
+            int currentOutputFrameIdx = outputFrameIdx;
+            if (splitByClip)
+            {
+                if (!actionStates.TryGetValue(safeActionName, out var state))
+                {
+                    state = new ActionCaptureState
+                    {
+                        actionName = safeActionName,
+                        imageFolder = currentImageFolder,
+                        kpt2dFolder = currentKpt2dFolder,
+                        kpt2dBuffer = new List<float>(expectedSamples * joints.Length * 3),
+                        sampledFrames = 0
+                    };
+                    actionStates.Add(safeActionName, state);
+                }
+                currentKpt2dBuffer = state.kpt2dBuffer;
+                currentOutputFrameIdx = state.sampledFrames;
+            }
+
+            yield return StartCoroutine(CaptureSingleFrame(
+                lastFrameIdx,
+                currentOutputFrameIdx,
+                currentImageFolder,
+                imagePrefix,
+                currentKpt2dFolder,
+                kptPrefix,
+                rec,
+                currentKpt2dBuffer
+            ));
+
+            if (splitByClip)
+                actionStates[safeActionName].sampledFrames++;
+
+            if (shouldWrite3d)
+                AppendKpt3DWorldTJC3(kpt3dBuffer);
 
             outputFrameIdx++;
         }
 
-        WriteKpt2DNpy(kpt2dPath, kpt2dBuffer, outputFrameIdx, joints.Length);
+        if (splitByClip)
+        {
+            foreach (var kv in actionStates)
+            {
+                var state = kv.Value;
+                string actionKpt2dPath = Path.Combine(state.kpt2dFolder, kpt2dFileName);
+                WriteKpt2DNpy(actionKpt2dPath, state.kpt2dBuffer, state.sampledFrames, joints.Length);
+            }
+        }
+        else
+        {
+            WriteKpt2DNpy(kpt2dPath, kpt2dBuffer, outputFrameIdx, joints.Length);
+        }
         if (shouldWrite3d)
             WriteKpt3DNpy(kpt3dPath, kpt3dBuffer, outputFrameIdx, joints.Length);
 
-        WriteSequenceMeta(Path.Combine(metaFolder, "sequence.json"), totalFrames, outputFrameIdx);
+        WriteSequenceMeta(Path.Combine(metaFolder, "sequence.json"), actionFolderName, totalFrames, outputFrameIdx, stride);
         if (exportDatasetManifest)
             WriteDatasetManifest(root);
 
+        Debug.Log($"[OneCameraCaptureFrame] Capture summary | totalFrames={totalFrames}, stride={stride}, savedFrames={outputFrameIdx}, imageFolder={imageFolder}, splitOutputByClip={splitByClip}");
 
-        if (targetAnimator) targetAnimator.speed = oldSpeed;
+
+        if (targetAnimator)
+        {
+            targetAnimator.speed = oldSpeed;
+            targetAnimator.enabled = oldEnabled;
+        }
 
         rt.Release();
         Destroy(rt);
@@ -357,58 +526,112 @@ public class OneCameraCaptureFrame : MonoBehaviour
         Debug.Log("[OneCameraCaptureFrame] Done.");
     }
 
-    void FreezeAnimatorAtSample(int sampleIdx, int totalFrames)
+    void FreezeAnimatorAtSample(List<ClipSegment> clipSegments, int sampleIdx, int totalFrames)
     {
-        // 1. 启用 Animator 并将播放速度设为 0。
-        // 这样做是为了接管控制权，确保动画不会因为时间流逝而自动播放。
-        targetAnimator.enabled = true;
-        targetAnimator.speed = 0f;
+        if (clipSegments == null || clipSegments.Count == 0 || targetAnimator == null) return;
+        int localFrame;
+        var seg = GetSegmentAtFrame(clipSegments, sampleIdx, totalFrames, out localFrame);
 
-        // 2. 立即手动更新一次 Animator（增量时间为 0）。
-        // 这一步是为了确保 Animator 当前的状态机数据是最新的。
-        targetAnimator.Update(0f);
+        float localDenom = Mathf.Max(1f, seg.frameCount - 1f);
+        float localT01 = Mathf.Clamp01(localFrame / localDenom);
+        float tSec = localT01 * seg.clip.length;
 
-        // 3. 获取指定动画层（animatorLayer）当前正在播放的状态信息。
-        var st = targetAnimator.GetCurrentAnimatorStateInfo(animatorLayer);
+        targetAnimator.enabled = false;
+        seg.clip.SampleAnimation(targetAnimator.gameObject, tSec);
 
+        Debug.Log($"采样帧: {sampleIdx}/{Mathf.Max(0, totalFrames - 1)} | 动作: {seg.clip.name} | 局部帧: {localFrame}/{Mathf.Max(0, seg.frameCount - 1)} | 时间: {tSec:F3}s/{seg.clip.length:F3}s");
+    }
 
-        // 4. 获取该动画状态的唯一标识符（全路径哈希值）。
-        // 后面我们需要通过这个 hash 值告诉 Play 函数我们要跳回到哪个动画状态。
-        int hash = st.fullPathHash;
+    ClipSegment GetSegmentAtFrame(List<ClipSegment> clipSegments, int sampleIdx, int totalFrames, out int localFrame)
+    {
+        int clampedFrame = Mathf.Clamp(sampleIdx, 0, Mathf.Max(0, totalFrames - 1));
+        ClipSegment seg = clipSegments[clipSegments.Count - 1];
+        localFrame = Mathf.Max(0, seg.frameCount - 1);
 
-        // 5. 容错处理：如果获取到的 hash 为 0（通常表示 Animator 还没初始化完成或没开始播放）。
-        if (hash == 0)
+        for (int i = 0; i < clipSegments.Count; i++)
         {
-            // 强制播放该层的第 0 个默认状态，时间点设为 0（起始点）。
-            targetAnimator.Play(0, animatorLayer, 0f);
-            targetAnimator.Update(0f);
-
-            // 重新获取正确的状态 hash 值。
-            hash = targetAnimator.GetCurrentAnimatorStateInfo(animatorLayer).fullPathHash;
+            var s = clipSegments[i];
+            int segEnd = s.startFrame + s.frameCount;
+            if (clampedFrame < segEnd)
+            {
+                seg = s;
+                localFrame = clampedFrame - s.startFrame;
+                break;
+            }
         }
 
-        float totalFramesF = (float)totalFrames;
-        // 6. 设置归一化时间（Normalized Time）。
-        // 这是这段代码最关键的地方：Play 函数的第三个参数要求是 0.0 到 1.0 之间的浮点数。
-        // 0 代表动画开头，1 代表动画结束。
-        // 假设总共要采样 100 个姿态
-        // 3. 计算归一化时间 t01 (0.0 到 1.0)
-        // 使用 Mathf.Clamp 确保值不会超过 1.0，防止由于浮点数误差导致的越界
-        float t01 = Mathf.Clamp01(sampleIdx / totalFramesF);
+        return seg;
+    }
 
-        // 7. 核心操作：调用 Play 函数。
-        // 作用：让 Animator 立即跳转到指定状态（hash）的指定时间点（t01）。
-        targetAnimator.Play(hash, animatorLayer, t01);
+    string MakeSafePathName(string name)
+    {
+        string safe = string.IsNullOrWhiteSpace(name) ? "UnknownAction" : name;
+        char[] invalid = Path.GetInvalidFileNameChars();
+        for (int i = 0; i < invalid.Length; i++)
+            safe = safe.Replace(invalid[i], '_');
+        return safe;
+    }
 
-        // 8. 再次手动调用 Update(0)。
-        // 作用：让刚才 Play 函数设置的“跳转”立即生效，更新骨骼节点的位置。
-        targetAnimator.Update(0f);
+    List<AnimationClip> GetUniqueControllerClips(RuntimeAnimatorController ac)
+    {
+        var result = new List<AnimationClip>();
+        if (ac == null || ac.animationClips == null) return result;
 
-        // 9. 最后禁用 Animator。
-        // 这样角色就会彻底固定在当前的姿态，直到下一次调用此函数。
-        targetAnimator.enabled = false;
+        var seen = new HashSet<AnimationClip>();
+        foreach (var clip in ac.animationClips)
+        {
+            if (clip == null) continue;
+            if (seen.Add(clip)) result.Add(clip);
+        }
+        return result;
+    }
 
-        Debug.Log($"跳转到帧: {sampleIdx}, 对应时间点: {t01:P2}");
+    List<ClipSegment> BuildClipSegments(List<AnimationClip> clips)
+    {
+        var segments = new List<ClipSegment>();
+        if (clips == null || clips.Count == 0) return segments;
+
+        int start = 0;
+        foreach (var clip in clips)
+        {
+            if (clip == null) continue;
+            int frames = Mathf.Max(1, Mathf.RoundToInt(clip.length * clip.frameRate));
+            segments.Add(new ClipSegment
+            {
+                clip = clip,
+                startFrame = start,
+                frameCount = frames
+            });
+            start += frames;
+        }
+        return segments;
+    }
+
+    int GetTotalFramesFromSegments(List<ClipSegment> segments)
+    {
+        if (segments == null || segments.Count == 0) return 0;
+        var last = segments[segments.Count - 1];
+        return last.startFrame + last.frameCount;
+    }
+
+    void LogClipSegmentsSummary(List<ClipSegment> segments, string tag)
+    {
+        if (segments == null || segments.Count == 0)
+        {
+            Debug.LogWarning($"[OneCameraCaptureFrame] {tag}: no clip segments");
+            return;
+        }
+
+        float totalSec = 0f;
+        for (int i = 0; i < segments.Count; i++)
+        {
+            var s = segments[i];
+            totalSec += s.clip.length;
+            Debug.Log($"[OneCameraCaptureFrame] {tag} clip[{i}] = {s.clip.name}, length={s.clip.length:F3}s, fps={s.clip.frameRate:F2}, frames={s.frameCount}");
+        }
+
+        int totalFrames = GetTotalFramesFromSegments(segments);
+        Debug.Log($"<color=yellow>[OneCameraCaptureFrame] {tag} summary: clips={segments.Count}, totalLength={totalSec:F3}s, totalFrames={totalFrames}</color>");
     }
 
     IEnumerator CaptureSingleFrame(
@@ -416,6 +639,8 @@ public class OneCameraCaptureFrame : MonoBehaviour
         int outputFrameIdx,
         string imageFolder,
         string imgPrefix,
+        string kpt2dFolder,     // 新增
+        string kptPrefixName,   // 新增
         PoseRecord.Data.Frame2DRecordData rec,
         List<float> kpt2dBuffer
     )
@@ -424,30 +649,23 @@ public class OneCameraCaptureFrame : MonoBehaviour
         Directory.CreateDirectory(imageFolder);
         string imgPath = Path.Combine(imageFolder, $"{safeImagePrefix}_{outputFrameIdx:000000}.png");
 
+        if (captureWidth <= 0 || captureHeight <= 0)
+        {
+            Debug.LogError($"[OneCameraCaptureFrame] Invalid capture size: {captureWidth}x{captureHeight}");
+            yield break;
+        }
+
+        if (rt == null || !rt.IsCreated())
+        {
+            Debug.LogError("[OneCameraCaptureFrame] RenderTexture is null or not created.");
+            yield break;
+        }
+
         cam.targetTexture = rt;
         yield return new WaitForEndOfFrame();
         cam.Render();
 
-        bool written = false;
-
-        // 先尝试 AsyncGPUReadback
-        var req = AsyncGPUReadback.Request(rt, 0, TextureFormat.RGBA32);
-        yield return new WaitUntil(() => req.done);
-
-        if (!req.hasError)
-        {
-            tex.LoadRawTextureData(req.GetData<byte>());
-            tex.Apply(false, false);
-            File.WriteAllBytes(imgPath, tex.EncodeToPNG());
-            written = true;
-        }
-        else
-        {
-            Debug.LogWarning($"[OneCameraCaptureFrame] AsyncGPUReadback failed, fallback ReadPixels. frame={outputFrameIdx}");
-        }
-
-        // 回退方案：ReadPixels（Mac 上更稳）
-        if (!written)
+        try
         {
             var prev = RenderTexture.active;
             RenderTexture.active = rt;
@@ -456,10 +674,15 @@ public class OneCameraCaptureFrame : MonoBehaviour
             RenderTexture.active = prev;
 
             File.WriteAllBytes(imgPath, tex.EncodeToPNG());
-            written = true;
         }
-
-        cam.targetTexture = null;
+        catch (Exception ex)
+        {
+            Debug.LogError($"[OneCameraCaptureFrame] Failed to save PNG: {imgPath}\n{ex}");
+        }
+        finally
+        {
+            cam.targetTexture = null;
+        }
 
         if (!File.Exists(imgPath))
             Debug.LogError($"[OneCameraCaptureFrame] PNG write failed: {imgPath}");
@@ -467,7 +690,20 @@ public class OneCameraCaptureFrame : MonoBehaviour
             Debug.Log($"[OneCameraCaptureFrame] First frame saved: {imgPath}");
 
         FillRecord(rec, frameIdx);
-        AppendKeypointsAsPixelTJC3(kpt2dBuffer);
+
+        int start = kpt2dBuffer.Count;
+        AppendKeypointsAsPixelTJC3(kpt2dBuffer); // 追加当前帧 joints*3
+
+        if (exportKpt2dPerFrame)
+        {
+            int count = joints.Length * 3;
+            float[] oneFrame = new float[count];
+            for (int i = 0; i < count; i++) oneFrame[i] = kpt2dBuffer[start + i];
+
+            string safeKptPrefix = string.IsNullOrWhiteSpace(kptPrefixName) ? "kpt2d" : kptPrefixName;
+            string perFramePath = Path.Combine(kpt2dFolder, $"{safeKptPrefix}_{outputFrameIdx:000000}.npy");
+            WriteNpyFloat32_2D(perFramePath, oneFrame, joints.Length, 3);
+        }
     }
 
     void AppendKeypointsAsPixelTJC3(List<float> outBuffer)
@@ -489,18 +725,17 @@ public class OneCameraCaptureFrame : MonoBehaviour
         }
     }
 
-    void WriteSequenceMeta(string path, int totalFrames, int sampledFrames)
+    void WriteSequenceMeta(string path, string actionName, int totalFrames, int sampledFrames, int stride)
     {
         var seq = new PoseRecord.Data.SequenceMetaData
         {
             subject_id = subjectId,
-            action_id = actionId,
-            take_id = takeId,
+            action_id = actionName,
             camera_id = cameraId,
             total_frames = totalFrames,
             sampled_frames = sampledFrames,
             joints_count = joints != null ? joints.Length : 0,
-            pose_every_n_frames = poseEveryNFrames,
+            pose_every_n_frames = Mathf.Max(1, stride),
             width = captureWidth,
             height = captureHeight,
             fov = cam != null ? cam.fieldOfView : presetFov,
@@ -508,6 +743,17 @@ public class OneCameraCaptureFrame : MonoBehaviour
         };
 
         File.WriteAllText(path, JsonUtility.ToJson(seq, true), Encoding.UTF8);
+    }
+
+    string ResolveActionFolderName(AnimationClip captureClip)
+    {
+        if (useClipNameAsActionFolder && captureClip != null && !string.IsNullOrWhiteSpace(captureClip.name))
+            return MakeSafePathName(captureClip.name);
+
+        if (!string.IsNullOrWhiteSpace(actionId))
+            return MakeSafePathName(actionId);
+
+        return "ActionUnknown";
     }
 
     void WriteCameraIntrinsics(string path)
@@ -619,57 +865,42 @@ public class OneCameraCaptureFrame : MonoBehaviour
 
     void WriteDatasetManifest(string datasetRoot)
     {
-        string subjectsRoot = Path.Combine(datasetRoot, "subjects");
+        string actionsRoot = datasetRoot;
         var manifest = new PoseRecord.Data.DatasetManifestData
         {
             updated_at_utc = DateTime.UtcNow.ToString("o"),
-            takes = CollectTakeEntries(subjectsRoot)
+            actions = CollectActionEntries(actionsRoot)
         };
 
         string manifestPath = Path.Combine(datasetRoot, "dataset_manifest.json");
         File.WriteAllText(manifestPath, JsonUtility.ToJson(manifest, true), Encoding.UTF8);
     }
 
-    List<PoseRecord.Data.DatasetTakeEntry> CollectTakeEntries(string subjectsRoot)
+    List<PoseRecord.Data.DatasetActionEntry> CollectActionEntries(string actionsRoot)
     {
-        var list = new List<PoseRecord.Data.DatasetTakeEntry>();
-        if (!Directory.Exists(subjectsRoot)) return list;
+        var list = new List<PoseRecord.Data.DatasetActionEntry>();
+        if (!Directory.Exists(actionsRoot)) return list;
 
-        foreach (string subjectDir in Directory.GetDirectories(subjectsRoot))
+        foreach (string actionDir in Directory.GetDirectories(actionsRoot))
         {
-            string subjectIdValue = Path.GetFileName(subjectDir);
-            string actionsRoot = Path.Combine(subjectDir, "actions");
-            if (!Directory.Exists(actionsRoot)) continue;
+            string actionIdValue = Path.GetFileName(actionDir);
+            string camerasRoot = Path.Combine(actionDir, "cameras");
+            string[] cameraDirs = Directory.Exists(camerasRoot)
+                ? Directory.GetDirectories(camerasRoot)
+                : new string[0];
 
-            foreach (string actionDir in Directory.GetDirectories(actionsRoot))
+            string[] cameraIds = new string[cameraDirs.Length];
+            for (int i = 0; i < cameraDirs.Length; i++)
+                cameraIds[i] = Path.GetFileName(cameraDirs[i]);
+
+            list.Add(new PoseRecord.Data.DatasetActionEntry
             {
-                string actionIdValue = Path.GetFileName(actionDir);
-                string takesRoot = Path.Combine(actionDir, "takes");
-                if (!Directory.Exists(takesRoot)) continue;
-
-                foreach (string takeDir in Directory.GetDirectories(takesRoot))
-                {
-                    string takeIdValue = Path.GetFileName(takeDir);
-                    string camerasRoot = Path.Combine(takeDir, "cameras");
-                    string[] cameraDirs = Directory.Exists(camerasRoot)
-                        ? Directory.GetDirectories(camerasRoot)
-                        : new string[0];
-
-                    string[] cameraIds = new string[cameraDirs.Length];
-                    for (int i = 0; i < cameraDirs.Length; i++)
-                        cameraIds[i] = Path.GetFileName(cameraDirs[i]);
-
-                    list.Add(new PoseRecord.Data.DatasetTakeEntry
-                    {
-                        subject_id = subjectIdValue,
-                        action_id = actionIdValue,
-                        take_id = takeIdValue,
-                        take_path = $"subjects/{subjectIdValue}/actions/{actionIdValue}/takes/{takeIdValue}",
-                        camera_count = cameraIds.Length,
-                        camera_ids = cameraIds
-                    });
-                }
-            }
+                subject_id = "",
+                action_id = actionIdValue,
+                action_path = actionIdValue,
+                camera_count = cameraIds.Length,
+                camera_ids = cameraIds
+            });
         }
 
         return list;
@@ -742,6 +973,37 @@ public class OneCameraCaptureFrame : MonoBehaviour
         {
             list.Add(c);
             GetAllChildren(c, list);
+        }
+    }
+    // 最小 NPY writer：float32, C-order, shape=(rows, cols)
+    static void WriteNpyFloat32_2D(string path, float[] data, int rows, int cols)
+    {
+        if (data == null) throw new ArgumentNullException(nameof(data));
+        if (data.Length != rows * cols) throw new ArgumentException("data length mismatch");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
+
+        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var bw = new BinaryWriter(fs))
+        {
+            // magic + version
+            bw.Write((byte)0x93);
+            bw.Write(Encoding.ASCII.GetBytes("NUMPY"));
+            bw.Write((byte)1); // major
+            bw.Write((byte)0); // minor
+
+            string header = $"{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {cols}), }}";
+            int preamble = 10; // magic(6)+ver(2)+hlen(2)
+            int padLen = 16 - ((preamble + header.Length + 1) % 16);
+            if (padLen == 16) padLen = 0;
+            string fullHeader = header + new string(' ', padLen) + "\n";
+
+            byte[] headerBytes = Encoding.ASCII.GetBytes(fullHeader);
+            bw.Write((ushort)headerBytes.Length);
+            bw.Write(headerBytes);
+
+            for (int i = 0; i < data.Length; i++)
+                bw.Write(data[i]); // little-endian float32
         }
     }
 }

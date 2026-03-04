@@ -48,7 +48,6 @@ public class CameraRingPlacer : MonoBehaviour
     [Header("Dataset IDs")]
     public string subjectId = "S001";
     public string actionId = "A001";
-    public string takeId = "take_0001";
 
     [Tooltip("是否把每个相机输出放到各自子目录 camName/ 下")]
     public bool outputPerCameraSubfolder = true;
@@ -177,7 +176,8 @@ public class CameraRingPlacer : MonoBehaviour
                     cap.outRootFolder = outRootFolder;
                     cap.subjectId = subjectId;
                     cap.actionId = actionId;
-                    cap.takeId = takeId;
+                    cap.useClipNameAsActionFolder = true;
+                    cap.splitOutputByClip = false;
 
                     // 前缀
                     cap.captureFolderPrefix = "capture";

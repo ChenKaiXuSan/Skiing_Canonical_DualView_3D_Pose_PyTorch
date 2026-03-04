@@ -51,7 +51,6 @@ public class PoseRecorder : MonoBehaviour
     public string outRootFolder = "SkiDataset";
     public string subjectId = "S001";
     public string actionId = "A001";
-    public string takeId = "take_0001";
     public string kpt3dFileName = "kpt3d_poseRecorder.npy";
 
     [Header("Optional JSONL")]
@@ -105,8 +104,8 @@ public class PoseRecorder : MonoBehaviour
     {
         if (!exportJsonl) return;
 
-        string takeRoot = Path.Combine(Application.dataPath, "..", outRootFolder, "subjects", subjectId, "actions", actionId, "takes", takeId);
-        string kpt3dDir = Path.Combine(takeRoot, "kpt3d");
+        string actionRoot = Path.Combine(Application.dataPath, "..", outRootFolder, actionId);
+        string kpt3dDir = Path.Combine(actionRoot, "kpt3d");
         Directory.CreateDirectory(kpt3dDir);
 
         string outPath = Path.Combine(kpt3dDir, jsonlFileName);
@@ -218,8 +217,8 @@ public class PoseRecorder : MonoBehaviour
     {
         if (sampledFrames <= 0 || joints == null || joints.Length == 0) return;
 
-        string takeRoot = Path.Combine(Application.dataPath, "..", outRootFolder, "subjects", subjectId, "actions", actionId, "takes", takeId);
-        string kpt3dDir = Path.Combine(takeRoot, "kpt3d");
+        string actionRoot = Path.Combine(Application.dataPath, "..", outRootFolder, actionId);
+        string kpt3dDir = Path.Combine(actionRoot, "kpt3d");
         Directory.CreateDirectory(kpt3dDir);
 
         string path = Path.Combine(kpt3dDir, kpt3dFileName);
