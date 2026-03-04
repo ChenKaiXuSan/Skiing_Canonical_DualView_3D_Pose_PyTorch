@@ -47,3 +47,6 @@ sysinfo.txt
 *.apk
 *.unitypackage
 *.app
+
+# 保存的数据集
+SkiDataset

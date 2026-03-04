@@ -44,14 +44,26 @@ public class PoseRecorder : MonoBehaviour
     public Animator animator;
     public int animatorLayer = 0;
 
-    [Header("Output")]
-    public string outputFileName = "pose3d.jsonl";
+    [Tooltip("每隔多少帧采样一次（1=每帧）")]
+    public int poseEveryNFrames = 1;
+
+    [Header("Dataset Output")]
+    public string outRootFolder = "SkiDataset";
+    public string subjectId = "S001";
+    public string actionId = "A001";
+    public string takeId = "take_0001";
+    public string kpt3dFileName = "kpt3d_poseRecorder.npy";
+
+    [Header("Optional JSONL")]
+    public bool exportJsonl = false;
+    public string jsonlFileName = "pose3d.jsonl";
+
     public bool recordOnPlay = true;
 
     private StreamWriter writer;
-    private int baseFrameCount;
-    private float baseTime;
     private FrameRecord reusableRecord = new FrameRecord();
+    private List<float> kpt3dBuffer = new List<float>();
+    private int sampledFrames = 0;
 
     void Start()
     {
@@ -83,22 +95,22 @@ public class PoseRecorder : MonoBehaviour
         if (animator == null) animator = GetComponentInChildren<Animator>();
 
         // 3. 保存先のセットアップ
-        SetupWriter();
+        SetupOutput();
 
         // 4. メモリ効率のためのデータ構造準備
         PrepareReusableList();
     }
 
-    void SetupWriter()
+    void SetupOutput()
     {
-        string outDir = Path.Combine(Application.dataPath, "..", "RecordingsPose");
-        if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
+        if (!exportJsonl) return;
 
-        string outPath = Path.Combine(outDir, outputFileName);
+        string takeRoot = Path.Combine(Application.dataPath, "..", outRootFolder, "subjects", subjectId, "actions", actionId, "takes", takeId);
+        string kpt3dDir = Path.Combine(takeRoot, "kpt3d");
+        Directory.CreateDirectory(kpt3dDir);
+
+        string outPath = Path.Combine(kpt3dDir, jsonlFileName);
         writer = new StreamWriter(outPath, false, Encoding.UTF8);
-
-        baseFrameCount = Time.frameCount;
-        baseTime = Time.time;
     }
 
     void PrepareReusableList()
@@ -113,10 +125,12 @@ public class PoseRecorder : MonoBehaviour
 
     void LateUpdate()
     {
-        if (writer == null || joints == null) return;
+        if (joints == null || joints.Length == 0) return;
 
-        reusableRecord.frame = Time.frameCount - baseFrameCount;
-        reusableRecord.time = Time.time - baseTime;
+        if (poseEveryNFrames > 1 && (Time.frameCount % poseEveryNFrames != 0)) return;
+
+        reusableRecord.frame = sampledFrames;
+        reusableRecord.time = Time.time;
 
         // ボーン座標の更新
         for (int i = 0; i < joints.Length; i++)
@@ -127,7 +141,13 @@ public class PoseRecorder : MonoBehaviour
             jData.x = joints[i].position.x;
             jData.y = joints[i].position.y;
             jData.z = joints[i].position.z;
+
+            kpt3dBuffer.Add(jData.x);
+            kpt3dBuffer.Add(jData.y);
+            kpt3dBuffer.Add(jData.z);
         }
+
+        sampledFrames++;
 
         // アニメーション情報の取得
         if (animator != null)
@@ -154,7 +174,8 @@ public class PoseRecorder : MonoBehaviour
 
         }
 
-        writer.WriteLine(JsonUtility.ToJson(reusableRecord));
+        if (writer != null)
+            writer.WriteLine(JsonUtility.ToJson(reusableRecord));
     }
 
     void GetAllChildren(Transform parent, List<Transform> result)
@@ -180,14 +201,54 @@ public class PoseRecorder : MonoBehaviour
     //     }
     // }
     public void Close()
-{
-    if (writer != null)
     {
-        writer.Flush();
-        writer.Close();
-        writer = null;
-        Debug.Log("[PoseRecorder] 録画を終了し、保存しました。");
+        WriteKpt3DNpy();
+
+        if (writer != null)
+        {
+            writer.Flush();
+            writer.Close();
+            writer = null;
+        }
+
+        Debug.Log($"[PoseRecorder] 录制结束，3D关键点已保存（T={sampledFrames}, J={(joints != null ? joints.Length : 0)}）。");
     }
-}
+
+    void WriteKpt3DNpy()
+    {
+        if (sampledFrames <= 0 || joints == null || joints.Length == 0) return;
+
+        string takeRoot = Path.Combine(Application.dataPath, "..", outRootFolder, "subjects", subjectId, "actions", actionId, "takes", takeId);
+        string kpt3dDir = Path.Combine(takeRoot, "kpt3d");
+        Directory.CreateDirectory(kpt3dDir);
+
+        string path = Path.Combine(kpt3dDir, kpt3dFileName);
+        WriteFloatNpy(path, kpt3dBuffer, sampledFrames, joints.Length, 3);
+    }
+
+    void WriteFloatNpy(string path, List<float> data, int d0, int d1, int d2)
+    {
+        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var bw = new BinaryWriter(fs))
+        {
+            bw.Write((byte)0x93);
+            bw.Write(Encoding.ASCII.GetBytes("NUMPY"));
+            bw.Write((byte)1);
+            bw.Write((byte)0);
+
+            string dict = $"{{'descr': '<f4', 'fortran_order': False, 'shape': ({d0}, {d1}, {d2}), }}";
+            int preambleLen = 10;
+            int padLen = 16 - ((preambleLen + dict.Length + 1) % 16);
+            if (padLen == 16) padLen = 0;
+            string header = dict + new string(' ', padLen) + "\n";
+
+            byte[] headerBytes = Encoding.ASCII.GetBytes(header);
+            bw.Write((ushort)headerBytes.Length);
+            bw.Write(headerBytes);
+
+            for (int i = 0; i < data.Count; i++)
+                bw.Write(data[i]);
+        }
+    }
 
 }

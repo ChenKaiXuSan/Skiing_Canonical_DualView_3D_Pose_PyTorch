@@ -35,10 +35,82 @@ namespace PoseRecord.Data
         public string label;
         public List<Joint2DData> joints2d = new List<Joint2DData>();
     }
+
+    [Serializable]
+    public class SequenceMetaData
+    {
+        public string subject_id;
+        public string action_id;
+        public string take_id;
+        public string camera_id;
+        public int total_frames;
+        public int sampled_frames;
+        public int joints_count;
+        public int pose_every_n_frames;
+        public int width;
+        public int height;
+        public float fov;
+        public string created_at_utc;
+    }
+
+    [Serializable]
+    public class CameraIntrinsicsData
+    {
+        public int width;
+        public int height;
+        public float fx;
+        public float fy;
+        public float cx;
+        public float cy;
+    }
+
+    [Serializable]
+    public class CameraExtrinsicsData
+    {
+        public float[] t_world_cam_4x4;
+        public float[] position_world_xyz;
+        public float[] rotation_world_quat_xyzw;
+    }
+
+    [Serializable]
+    public class DatasetManifestData
+    {
+        public string updated_at_utc;
+        public List<DatasetTakeEntry> takes = new List<DatasetTakeEntry>();
+    }
+
+    [Serializable]
+    public class DatasetTakeEntry
+    {
+        public string subject_id;
+        public string action_id;
+        public string take_id;
+        public string take_path;
+        public int camera_count;
+        public string[] camera_ids;
+    }
 }
 
 public class OneCameraCaptureFrame : MonoBehaviour
 {
+    [Header("Output")]
+    public string outRootFolder = "SkiDataset";
+    public string subjectId = "S001";
+    public string actionId = "A001";
+    public string takeId = "take_0001";
+    public string cameraId = "";
+
+    [Header("Output Naming")]
+    [Tooltip("帧目录名前缀，例如 capture_L0_A000")]
+    public string captureFolderPrefix = "capture";
+    [Tooltip("图片文件名前缀，例如 frame_000001.png")]
+    public string imagePrefix = "frame";
+    [Tooltip("2D 关键点 npy 文件名前缀，例如 kpt2d.npy")]
+    public string kptPrefix = "kpt2d";
+
+    [Tooltip("写出全相机共享的3D关键点（kpt3d/kpt3d.npy），若已存在则默认跳过")]
+    public bool exportSharedKpt3d = true;
+
     [Header("Auto Run")]
     public bool autoRunOnPlay = true;
     public float startDelaySec = 0.0f;
@@ -77,11 +149,18 @@ public class OneCameraCaptureFrame : MonoBehaviour
     public int presetTargetDisplay = 0; // 建议 0
     public int presetDepth = -1;
 
-    [Header("Output")]
-    public string outRootFolder = "RecordingsPose";
-    public string captureFolderPrefix = "capture";
-    public string imagePrefix = "frame";
-    public string kptPrefix = "kpt2d";
+    [Tooltip("当 kpt3d.npy 已存在时是否覆盖")]
+    public bool overwriteExistingKpt3d = false;
+
+    [Tooltip("是否在数据集根目录生成/刷新 dataset_manifest.json")]
+    public bool exportDatasetManifest = true;
+
+    [Header("NPZ Export")]
+    [Tooltip("同时导出 2D 关键点 npz（与 npy 并存）")]
+    public bool exportKpt2dNpz = true;
+
+    [Tooltip("同时导出 3D 关键点 npz（与 npy 并存）")]
+    public bool exportKpt3dNpz = false;
 
     // session
     private float baseTime;
@@ -90,8 +169,14 @@ public class OneCameraCaptureFrame : MonoBehaviour
     private RenderTexture rt;
     private Texture2D tex;
 
+    public bool IsCaptureDone { get; private set; } = false;
+    public bool IsCaptureStarted { get; private set; } = false;
+
     IEnumerator Start()
     {
+        IsCaptureStarted = true;
+        IsCaptureDone = false;
+
         if (!autoRunOnPlay) yield break;
 
         if (cam == null) cam = GetComponent<Camera>();
@@ -100,6 +185,9 @@ public class OneCameraCaptureFrame : MonoBehaviour
             Debug.LogError("[OneCameraCaptureFrame] Camera is null.");
             yield break;
         }
+
+        if (string.IsNullOrWhiteSpace(cameraId))
+            cameraId = cam.name;
 
         if (target == null)
         {
@@ -134,10 +222,20 @@ public class OneCameraCaptureFrame : MonoBehaviour
         if (startDelaySec > 0f)
             yield return new WaitForSeconds(startDelaySec);
 
-        if (targetAnimator == null) targetAnimator = GetComponent<Animator>();
+        if (targetAnimator == null) targetAnimator = target.GetComponentInChildren<Animator>();
+        if (targetAnimator == null)
+        {
+            Debug.LogError("[OneCameraCaptureFrame] targetAnimator is null.");
+            yield break;
+        }
 
         // get total frames
         RuntimeAnimatorController ac = targetAnimator.runtimeAnimatorController;
+        if (ac == null)
+        {
+            Debug.LogError("[OneCameraCaptureFrame] targetAnimator.runtimeAnimatorController is null.");
+            yield break;
+        }
 
         int totalFrames = 0;
 
@@ -155,30 +253,57 @@ public class OneCameraCaptureFrame : MonoBehaviour
 
         Debug.Log($"<color=yellow>所有动画的总帧数: {totalFrames}</color>");
 
+        if (totalFrames <= 0)
+        {
+            Debug.LogError("[OneCameraCaptureFrame] totalFrames <= 0，无法采样。");
+            yield break;
+        }
+
         baseTime = Time.time;
         yield return StartCoroutine(CaptureSequence(totalFrames));
+
+        IsCaptureDone = true;
 
         // 结束之后退出
     }
 
     IEnumerator CaptureSequence(int totalFrames)
     {
-        // output folder
         string root = Path.Combine(Application.dataPath, "..", outRootFolder);
-        Directory.CreateDirectory(root);
+        string takeRoot = Path.Combine(root, "subjects", subjectId, "actions", actionId, "takes", takeId);
+        string metaFolder = Path.Combine(takeRoot, "meta");
+        string cameraFolder = Path.Combine(takeRoot, "cameras", cameraId);
 
+        // 使用 captureFolderPrefix 生成帧目录名
+        string captureFolderName = string.IsNullOrWhiteSpace(captureFolderPrefix)
+            ? cameraId
+            : $"{captureFolderPrefix}_{cameraId}";
 
-        string capFolder = Path.Combine(
-            root, $"{captureFolderPrefix}"
-        );
-        Directory.CreateDirectory(capFolder);
+        string frameRoot = Path.Combine(takeRoot, "frames", captureFolderName);
+        string imageFolder = Path.Combine(frameRoot, "images");
 
-        Debug.Log($"[OneCameraCaptureFrame] Output: {capFolder}");
+        // 使用 kptPrefix 生成 2D 关键点文件名
+        string kpt2dFileName = string.IsNullOrWhiteSpace(kptPrefix) ? "kpt2d.npy" : $"{kptPrefix}.npy";
+        string kpt2dPath = Path.Combine(frameRoot, kpt2dFileName);
+
+        string kpt3dFolder = Path.Combine(takeRoot, "kpt3d");
+        string kpt3dPath = Path.Combine(kpt3dFolder, "kpt3d.npy");
+
+        Directory.CreateDirectory(metaFolder);
+        Directory.CreateDirectory(cameraFolder);
+        Directory.CreateDirectory(imageFolder);
+        Directory.CreateDirectory(kpt3dFolder);
+
+        Debug.Log($"[OneCameraCaptureFrame] Output camera folder: {frameRoot}");
 
         // allocate RT & texture
         rt = new RenderTexture(captureWidth, captureHeight, 24, RenderTextureFormat.ARGB32);
         rt.Create();
         tex = new Texture2D(captureWidth, captureHeight, TextureFormat.RGBA32, false);
+
+        WriteSequenceMeta(Path.Combine(metaFolder, "sequence.json"), totalFrames, 0);
+        WriteCameraIntrinsics(Path.Combine(cameraFolder, "intrinsics.json"));
+        WriteCameraExtrinsics(Path.Combine(cameraFolder, "extrinsics.json"));
 
         // record template
         var rec = new PoseRecord.Data.Frame2DRecordData();
@@ -189,34 +314,38 @@ public class OneCameraCaptureFrame : MonoBehaviour
 
         float oldSpeed = targetAnimator ? targetAnimator.speed : 1f;
 
-        int sampleIdx = 0;
+        int stride = Mathf.Max(1, poseEveryNFrames);
+        int expectedSamples = Mathf.CeilToInt(totalFrames / (float)stride);
+        var kpt2dBuffer = new List<float>(expectedSamples * joints.Length * 3);
+        var kpt3dBuffer = new List<float>(expectedSamples * joints.Length * 3);
+        bool shouldWrite3d = exportSharedKpt3d && (overwriteExistingKpt3d || !File.Exists(kpt3dPath));
 
-        while (sampleIdx < totalFrames)
+        int outputFrameIdx = 0;
+
+        for (int sampleIdx = 0; sampleIdx < totalFrames; sampleIdx += stride)
         {
-            // 1) 跳过不采样的帧
-            if (sampleIdx % poseEveryNFrames != 0)
-            {
-                sampleIdx++;
-                continue;
-            }
-
-            // 2) 冻结到第 sampleIdx 个采样姿态
             if (targetAnimator)
                 FreezeAnimatorAtSample(sampleIdx, totalFrames);
 
-            // 3) 输出目录
-            string frameFolder = Path.Combine(capFolder, $"frame_{sampleIdx:000000}");
-            Directory.CreateDirectory(frameFolder);
+            // 传入 imagePrefix
+            yield return StartCoroutine(CaptureSingleFrame(sampleIdx, outputFrameIdx, imageFolder, imagePrefix, rec, kpt2dBuffer));
 
-            // 4) 单视角采集
-            yield return StartCoroutine(CaptureSingleFrame(sampleIdx, frameFolder, rec));
+            if (shouldWrite3d)
+                AppendKpt3DWorldTJC3(kpt3dBuffer);
 
-            // 5) 解冻 animator（给下一轮用）
             if (targetAnimator)
                 targetAnimator.enabled = true;
 
-            sampleIdx++;
+            outputFrameIdx++;
         }
+
+        WriteKpt2DNpy(kpt2dPath, kpt2dBuffer, outputFrameIdx, joints.Length);
+        if (shouldWrite3d)
+            WriteKpt3DNpy(kpt3dPath, kpt3dBuffer, outputFrameIdx, joints.Length);
+
+        WriteSequenceMeta(Path.Combine(metaFolder, "sequence.json"), totalFrames, outputFrameIdx);
+        if (exportDatasetManifest)
+            WriteDatasetManifest(root);
 
 
         if (targetAnimator) targetAnimator.speed = oldSpeed;
@@ -284,38 +413,266 @@ public class OneCameraCaptureFrame : MonoBehaviour
 
     IEnumerator CaptureSingleFrame(
         int frameIdx,
-        string frameFolder,
-        PoseRecord.Data.Frame2DRecordData rec
+        int outputFrameIdx,
+        string imageFolder,
+        string imgPrefix,
+        PoseRecord.Data.Frame2DRecordData rec,
+        List<float> kpt2dBuffer
     )
     {
-        string imgPath = Path.Combine(
-            frameFolder, $"{imagePrefix}_frame_{frameIdx:000000}.png"
-        );
-        string jsonPath = Path.Combine(
-            frameFolder, $"{kptPrefix}_frame_{frameIdx:000000}.json"
-        );
+        string safeImagePrefix = string.IsNullOrWhiteSpace(imgPrefix) ? "frame" : imgPrefix;
+        Directory.CreateDirectory(imageFolder);
+        string imgPath = Path.Combine(imageFolder, $"{safeImagePrefix}_{outputFrameIdx:000000}.png");
 
         cam.targetTexture = rt;
         yield return new WaitForEndOfFrame();
         cam.Render();
 
+        bool written = false;
+
+        // 先尝试 AsyncGPUReadback
         var req = AsyncGPUReadback.Request(rt, 0, TextureFormat.RGBA32);
         yield return new WaitUntil(() => req.done);
 
-        // 保存图片
         if (!req.hasError)
         {
             tex.LoadRawTextureData(req.GetData<byte>());
             tex.Apply(false, false);
-            // FlipTextureVertical(tex); // ！ 不需要翻转，已经是正确方向了
             File.WriteAllBytes(imgPath, tex.EncodeToPNG());
+            written = true;
+        }
+        else
+        {
+            Debug.LogWarning($"[OneCameraCaptureFrame] AsyncGPUReadback failed, fallback ReadPixels. frame={outputFrameIdx}");
+        }
+
+        // 回退方案：ReadPixels（Mac 上更稳）
+        if (!written)
+        {
+            var prev = RenderTexture.active;
+            RenderTexture.active = rt;
+            tex.ReadPixels(new Rect(0, 0, captureWidth, captureHeight), 0, 0, false);
+            tex.Apply(false, false);
+            RenderTexture.active = prev;
+
+            File.WriteAllBytes(imgPath, tex.EncodeToPNG());
+            written = true;
         }
 
         cam.targetTexture = null;
 
-        // 保存 keypoints
+        if (!File.Exists(imgPath))
+            Debug.LogError($"[OneCameraCaptureFrame] PNG write failed: {imgPath}");
+        else if (outputFrameIdx == 0)
+            Debug.Log($"[OneCameraCaptureFrame] First frame saved: {imgPath}");
+
         FillRecord(rec, frameIdx);
-        File.WriteAllText(jsonPath, JsonUtility.ToJson(rec, false), Encoding.UTF8);
+        AppendKeypointsAsPixelTJC3(kpt2dBuffer);
+    }
+
+    void AppendKeypointsAsPixelTJC3(List<float> outBuffer)
+    {
+        for (int i = 0; i < joints.Length; i++)
+        {
+            Vector3 vp = cam.WorldToViewportPoint(joints[i].position);
+            float conf = (vp.z > 0 && vp.x >= 0 && vp.x <= 1 && vp.y >= 0 && vp.y <= 1) ? 1f : 0f;
+
+            float x01 = flipX ? 1f - vp.x : vp.x;
+            float y01 = flipYToTopLeft ? 1f - vp.y : vp.y;
+
+            float x = x01 * (captureWidth - 1);
+            float y = y01 * (captureHeight - 1);
+
+            outBuffer.Add(x);
+            outBuffer.Add(y);
+            outBuffer.Add(conf);
+        }
+    }
+
+    void WriteSequenceMeta(string path, int totalFrames, int sampledFrames)
+    {
+        var seq = new PoseRecord.Data.SequenceMetaData
+        {
+            subject_id = subjectId,
+            action_id = actionId,
+            take_id = takeId,
+            camera_id = cameraId,
+            total_frames = totalFrames,
+            sampled_frames = sampledFrames,
+            joints_count = joints != null ? joints.Length : 0,
+            pose_every_n_frames = poseEveryNFrames,
+            width = captureWidth,
+            height = captureHeight,
+            fov = cam != null ? cam.fieldOfView : presetFov,
+            created_at_utc = DateTime.UtcNow.ToString("o")
+        };
+
+        File.WriteAllText(path, JsonUtility.ToJson(seq, true), Encoding.UTF8);
+    }
+
+    void WriteCameraIntrinsics(string path)
+    {
+        float fovRad = cam.fieldOfView * Mathf.Deg2Rad;
+        float fy = 0.5f * captureHeight / Mathf.Tan(0.5f * fovRad);
+        float fx = fy * (captureWidth / (float)captureHeight);
+
+        var intr = new PoseRecord.Data.CameraIntrinsicsData
+        {
+            width = captureWidth,
+            height = captureHeight,
+            fx = fx,
+            fy = fy,
+            cx = (captureWidth - 1) * 0.5f,
+            cy = (captureHeight - 1) * 0.5f
+        };
+
+        File.WriteAllText(path, JsonUtility.ToJson(intr, true), Encoding.UTF8);
+    }
+
+    void WriteCameraExtrinsics(string path)
+    {
+        Matrix4x4 w2c = cam.worldToCameraMatrix;
+        Quaternion q = cam.transform.rotation;
+        Vector3 p = cam.transform.position;
+
+        var ex = new PoseRecord.Data.CameraExtrinsicsData
+        {
+            t_world_cam_4x4 = new float[16]
+            {
+                w2c.m00, w2c.m01, w2c.m02, w2c.m03,
+                w2c.m10, w2c.m11, w2c.m12, w2c.m13,
+                w2c.m20, w2c.m21, w2c.m22, w2c.m23,
+                w2c.m30, w2c.m31, w2c.m32, w2c.m33,
+            },
+            position_world_xyz = new float[] { p.x, p.y, p.z },
+            rotation_world_quat_xyzw = new float[] { q.x, q.y, q.z, q.w }
+        };
+
+        File.WriteAllText(path, JsonUtility.ToJson(ex, true), Encoding.UTF8);
+    }
+
+    void WriteKpt2DNpy(string path, List<float> data, int t, int j)
+    {
+        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var bw = new BinaryWriter(fs))
+        {
+            bw.Write((byte)0x93);
+            bw.Write(Encoding.ASCII.GetBytes("NUMPY"));
+            bw.Write((byte)1);
+            bw.Write((byte)0);
+
+            string dict = $"{{'descr': '<f4', 'fortran_order': False, 'shape': ({t}, {j}, 3), }}";
+            int preambleLen = 10;
+            int padLen = 16 - ((preambleLen + dict.Length + 1) % 16);
+            if (padLen == 16) padLen = 0;
+            string header = dict + new string(' ', padLen) + "\n";
+
+            byte[] headerBytes = Encoding.ASCII.GetBytes(header);
+            bw.Write((ushort)headerBytes.Length);
+            bw.Write(headerBytes);
+
+            for (int i = 0; i < data.Count; i++)
+                bw.Write(data[i]);
+        }
+    }
+
+    void AppendKpt3DWorldTJC3(List<float> outBuffer)
+    {
+        for (int i = 0; i < joints.Length; i++)
+        {
+            Vector3 p = joints[i].position;
+            outBuffer.Add(p.x);
+            outBuffer.Add(p.y);
+            outBuffer.Add(p.z);
+        }
+    }
+
+    void WriteKpt3DNpy(string path, List<float> data, int t, int j)
+    {
+        WriteFloatNpy(path, data, t, j, 3);
+    }
+
+    void WriteFloatNpy(string path, List<float> data, int d0, int d1, int d2)
+    {
+        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var bw = new BinaryWriter(fs))
+        {
+            bw.Write((byte)0x93);
+            bw.Write(Encoding.ASCII.GetBytes("NUMPY"));
+            bw.Write((byte)1);
+            bw.Write((byte)0);
+
+            string dict = $"{{'descr': '<f4', 'fortran_order': False, 'shape': ({d0}, {d1}, {d2}), }}";
+            int preambleLen = 10;
+            int padLen = 16 - ((preambleLen + dict.Length + 1) % 16);
+            if (padLen == 16) padLen = 0;
+            string header = dict + new string(' ', padLen) + "\n";
+
+            byte[] headerBytes = Encoding.ASCII.GetBytes(header);
+            bw.Write((ushort)headerBytes.Length);
+            bw.Write(headerBytes);
+
+            for (int i = 0; i < data.Count; i++)
+                bw.Write(data[i]);
+        }
+    }
+
+    void WriteDatasetManifest(string datasetRoot)
+    {
+        string subjectsRoot = Path.Combine(datasetRoot, "subjects");
+        var manifest = new PoseRecord.Data.DatasetManifestData
+        {
+            updated_at_utc = DateTime.UtcNow.ToString("o"),
+            takes = CollectTakeEntries(subjectsRoot)
+        };
+
+        string manifestPath = Path.Combine(datasetRoot, "dataset_manifest.json");
+        File.WriteAllText(manifestPath, JsonUtility.ToJson(manifest, true), Encoding.UTF8);
+    }
+
+    List<PoseRecord.Data.DatasetTakeEntry> CollectTakeEntries(string subjectsRoot)
+    {
+        var list = new List<PoseRecord.Data.DatasetTakeEntry>();
+        if (!Directory.Exists(subjectsRoot)) return list;
+
+        foreach (string subjectDir in Directory.GetDirectories(subjectsRoot))
+        {
+            string subjectIdValue = Path.GetFileName(subjectDir);
+            string actionsRoot = Path.Combine(subjectDir, "actions");
+            if (!Directory.Exists(actionsRoot)) continue;
+
+            foreach (string actionDir in Directory.GetDirectories(actionsRoot))
+            {
+                string actionIdValue = Path.GetFileName(actionDir);
+                string takesRoot = Path.Combine(actionDir, "takes");
+                if (!Directory.Exists(takesRoot)) continue;
+
+                foreach (string takeDir in Directory.GetDirectories(takesRoot))
+                {
+                    string takeIdValue = Path.GetFileName(takeDir);
+                    string camerasRoot = Path.Combine(takeDir, "cameras");
+                    string[] cameraDirs = Directory.Exists(camerasRoot)
+                        ? Directory.GetDirectories(camerasRoot)
+                        : new string[0];
+
+                    string[] cameraIds = new string[cameraDirs.Length];
+                    for (int i = 0; i < cameraDirs.Length; i++)
+                        cameraIds[i] = Path.GetFileName(cameraDirs[i]);
+
+                    list.Add(new PoseRecord.Data.DatasetTakeEntry
+                    {
+                        subject_id = subjectIdValue,
+                        action_id = actionIdValue,
+                        take_id = takeIdValue,
+                        take_path = $"subjects/{subjectIdValue}/actions/{actionIdValue}/takes/{takeIdValue}",
+                        camera_count = cameraIds.Length,
+                        camera_ids = cameraIds
+                    });
+                }
+            }
+        }
+
+        return list;
     }
 
     void FillRecord(PoseRecord.Data.Frame2DRecordData rec, int frameIdx)

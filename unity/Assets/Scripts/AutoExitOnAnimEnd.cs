@@ -19,9 +19,28 @@ public class AutoExitOnAnimEnd : MonoBehaviour
     public bool quitAppInBuild = false;         // 打包运行：自动退出程序
     public int extraFramesAfterFinish = 0;      // 播完后再多录N帧（避免最后一帧没写到）
 
+    [Header("Recorder Finalize")]
+    [Tooltip("结束前主动调用 PoseRecorder.Close()，确保数据落盘")]
+    public bool closePoseRecordersBeforeExit = true;
+
+    [Tooltip("自动查找场景里的 PoseRecorder")]
+    public bool autoFindPoseRecorders = true;
+
+    public PoseRecorder[] poseRecorders;
+
+    [Header("Wait Capture")]
+    [Tooltip("退出前等待场景内 OneCameraCaptureFrame 全部完成")]
+    public bool waitAllCapturesDone = true;
+
+    [Tooltip("自动查找场景里的 OneCameraCaptureFrame")]
+    public bool autoFindCaptureFrames = true;
+
+    public OneCameraCaptureFrame[] captureFrames;
+
     bool finished = false;
     int extraCount = 0;
     int targetHash = 0;
+    bool recorderClosed = false;
 
     void Start()
     {
@@ -37,6 +56,12 @@ public class AutoExitOnAnimEnd : MonoBehaviour
 
         if (!string.IsNullOrEmpty(stateName))
             targetHash = Animator.StringToHash(stateName);
+
+        if (autoFindPoseRecorders)
+            poseRecorders = FindObjectsOfType<PoseRecorder>(true);
+
+        if (autoFindCaptureFrames)
+            captureFrames = FindObjectsOfType<OneCameraCaptureFrame>(true);
     }
 
     void Update()
@@ -71,11 +96,16 @@ public class AutoExitOnAnimEnd : MonoBehaviour
             return;
         }
 
+        if (waitAllCapturesDone && !AreAllCapturesDone())
+            return;
+
         ExitNow();
     }
 
     void ExitNow()
     {
+        CloseRecordersIfNeeded();
+
 #if UNITY_EDITOR
         if (exitPlayModeInEditor)
         {
@@ -89,5 +119,45 @@ public class AutoExitOnAnimEnd : MonoBehaviour
             Debug.Log("[AutoExitOnAnimEnd] Quit Application.");
             Application.Quit();
         }
+    }
+
+    void CloseRecordersIfNeeded()
+    {
+        if (!closePoseRecordersBeforeExit || recorderClosed) return;
+
+        if (poseRecorders == null || poseRecorders.Length == 0)
+            poseRecorders = FindObjectsOfType<PoseRecorder>(true);
+
+        for (int i = 0; i < poseRecorders.Length; i++)
+        {
+            if (poseRecorders[i] == null) continue;
+            poseRecorders[i].Close();
+        }
+
+        recorderClosed = true;
+    }
+
+    bool AreAllCapturesDone()
+    {
+        if (captureFrames == null || captureFrames.Length == 0)
+        {
+            if (autoFindCaptureFrames)
+                captureFrames = FindObjectsOfType<OneCameraCaptureFrame>(true);
+        }
+
+        if (captureFrames == null || captureFrames.Length == 0)
+            return true;
+
+        for (int i = 0; i < captureFrames.Length; i++)
+        {
+            var cap = captureFrames[i];
+            if (cap == null) continue;
+            if (!cap.autoRunOnPlay) continue;
+
+            if (!cap.IsCaptureDone)
+                return false;
+        }
+
+        return true;
     }
 }
