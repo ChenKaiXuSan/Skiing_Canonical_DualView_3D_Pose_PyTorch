@@ -176,6 +176,8 @@ public class CameraRingPlacer : MonoBehaviour
                     cap.outRootFolder = outRootFolder;
                     cap.subjectId = subjectId;
                     cap.actionId = actionId;
+                    cap.characterFolderName = subjectId;
+                    cap.autoUseTargetNameAsCharacterFolder = false;
                     cap.useClipNameAsActionFolder = true;
                     cap.splitOutputByClip = false;
 
