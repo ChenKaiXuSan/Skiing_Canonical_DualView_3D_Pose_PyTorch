@@ -25,8 +25,11 @@ public class AutoExitOnAnimEnd : MonoBehaviour
     [Tooltip("如果动画结束条件长期不满足，但采集已全部完成，则允许直接退出")]
     public bool allowExitWhenCapturesDone = true;
 
-    [Tooltip("从启动开始的最大等待秒数，超时后可强制退出（<=0 表示禁用）")]
-    public float forceExitTimeoutSec = 120f;
+    [Tooltip("从启动开始的最大等待秒数，超时后可强制退出（<=0 表示禁用，默认禁用）")]
+    public float forceExitTimeoutSec = -1f;
+
+    [Tooltip("即使仍有采集未完成，也允许超时后强制退出。默认关闭，避免中途退出。")]
+    public bool forceExitEvenIfCapturesPending = false;
 
     [Header("Wait Capture")]
     [Tooltip("退出前等待场景内 OneCameraCaptureFrame 全部完成")]
@@ -45,6 +48,7 @@ public class AutoExitOnAnimEnd : MonoBehaviour
     int targetHash;
     float startRealtime;
     bool hasLoggedAnimFinish;
+    bool hasLoggedTimeoutBlocked;
     int lastLoggedParticipating = -1;
     int lastLoggedTotal = -1;
     int lastLoggedPending = -1;
@@ -104,8 +108,16 @@ public class AutoExitOnAnimEnd : MonoBehaviour
         {
             if (forceExitTimeoutSec > 0f && Time.realtimeSinceStartup - startRealtime >= forceExitTimeoutSec)
             {
-                Debug.LogWarning("[AutoExitOnAnimEnd] Force exit timeout reached.");
-                ExitNow();
+                if (!waitAllCapturesDone || forceExitEvenIfCapturesPending || IsCaptureCompletionSatisfied(requireAtLeastOneCapture: false))
+                {
+                    Debug.LogWarning("[AutoExitOnAnimEnd] Force exit timeout reached.");
+                    ExitNow();
+                }
+                else if (!hasLoggedTimeoutBlocked)
+                {
+                    Debug.LogWarning("[AutoExitOnAnimEnd] Timeout reached but captures are still running; keep waiting.");
+                    hasLoggedTimeoutBlocked = true;
+                }
             }
             return;
         }
@@ -120,8 +132,16 @@ public class AutoExitOnAnimEnd : MonoBehaviour
         {
             if (forceExitTimeoutSec > 0f && Time.realtimeSinceStartup - startRealtime >= forceExitTimeoutSec)
             {
-                Debug.LogWarning("[AutoExitOnAnimEnd] Force exit after timeout while waiting captures.");
-                ExitNow();
+                if (forceExitEvenIfCapturesPending)
+                {
+                    Debug.LogWarning("[AutoExitOnAnimEnd] Force exit after timeout while waiting captures.");
+                    ExitNow();
+                }
+                else if (!hasLoggedTimeoutBlocked)
+                {
+                    Debug.LogWarning("[AutoExitOnAnimEnd] Timeout reached but captures are still running; keep waiting.");
+                    hasLoggedTimeoutBlocked = true;
+                }
             }
             return;
         }

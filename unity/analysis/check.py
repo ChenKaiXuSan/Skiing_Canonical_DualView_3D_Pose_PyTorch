@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import shutil
 import statistics
 import struct
+import subprocess
 import zipfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -78,6 +80,7 @@ class ActionReport:
 
     has_kpt3d_npz: bool = False
     kpt3d_npz_arrays: dict[str, list[int] | None] = field(default_factory=dict)
+    kpt3d_visuals: list[str] = field(default_factory=list)
 
     camera_reports: list[CameraReport] = field(default_factory=list)
     issues: list[Issue] = field(default_factory=list)
@@ -166,6 +169,31 @@ def parse_args() -> argparse.Namespace:
         dest="viz_auto_filter_helper_joints",
         action="store_false",
         help="Disable automatic helper-joint filtering",
+    )
+    parser.add_argument(
+        "--kpt3d-viz-frames",
+        type=int,
+        default=3,
+        help="How many frames to visualize for action-level kpt3d when not using --kpt3d-viz-all-frames (default: 3)",
+    )
+    parser.add_argument(
+        "--kpt3d-viz-all-frames",
+        action="store_true",
+        default=False,
+        help="Visualize all kpt3d frames for each action",
+    )
+    parser.add_argument(
+        "--kpt3d-3d-backend",
+        type=str,
+        choices=["matlab", "svg"],
+        default="matlab",
+        help="Renderer for 3D perspective image (default: matlab)",
+    )
+    parser.add_argument(
+        "--matlab-command",
+        type=str,
+        default="matlab",
+        help="MATLAB executable command name/path (default: matlab)",
     )
     return parser.parse_args()
 
@@ -376,6 +404,309 @@ def normalize_points_to_pixels(points: list[tuple[float, float, float]], width: 
     return points
 
 
+def reshape_kpt3d_points(shape: list[int], data: list[float], frame_idx: int) -> list[tuple[float, float, float]]:
+    if len(shape) != 3 or shape[2] != 3:
+        return []
+    t = shape[0]
+    jn = shape[1]
+    if t <= 0 or jn <= 0:
+        return []
+
+    idx = max(0, min(frame_idx, t - 1))
+    start = idx * jn * 3
+    pts: list[tuple[float, float, float]] = []
+    for j in range(jn):
+        base = start + j * 3
+        pts.append((data[base], data[base + 1], data[base + 2]))
+    return pts
+
+
+def pick_frame_indices(total_frames: int, max_count: int) -> list[int]:
+    if total_frames <= 0 or max_count <= 0:
+        return []
+    if total_frames <= max_count:
+        return list(range(total_frames))
+
+    if max_count == 1:
+        return [total_frames // 2]
+
+    out: list[int] = []
+    for i in range(max_count):
+        idx = round(i * (total_frames - 1) / (max_count - 1))
+        out.append(idx)
+    return sorted(set(out))
+
+
+def project_to_panel(
+    x: float,
+    y: float,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    panel_x: float,
+    panel_y: float,
+    panel_w: float,
+    panel_h: float,
+) -> tuple[float, float]:
+    xr = x_max - x_min
+    yr = y_max - y_min
+    nx = 0.5 if abs(xr) < 1e-9 else (x - x_min) / xr
+    ny = 0.5 if abs(yr) < 1e-9 else (y - y_min) / yr
+    px = panel_x + nx * panel_w
+    py = panel_y + (1.0 - ny) * panel_h
+    return px, py
+
+
+def save_kpt3d_three_views_svg(out_path: Path, points: list[tuple[float, float, float]], title: str) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not points:
+        out_path.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="980" height="360"><text x="20" y="40" font-size="16">No kpt3d points</text></svg>', encoding="utf-8")
+        return
+
+    width, height = 980, 360
+    margin = 24
+    gap = 18
+    panel_w = (width - margin * 2 - gap * 2) / 3
+    panel_h = height - 90
+    panel_y = 50
+
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    zs = [p[2] for p in points]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    z_min, z_max = min(zs), max(zs)
+
+    panels = [
+        ("X-Y", xs, ys, x_min, x_max, y_min, y_max),
+        ("X-Z", xs, zs, x_min, x_max, z_min, z_max),
+        ("Y-Z", ys, zs, y_min, y_max, z_min, z_max),
+    ]
+
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{width/2}" y="28" text-anchor="middle" font-size="18" font-family="Arial">{svg_escape(title)}</text>',
+    ]
+
+    for i, (label, a_vals, b_vals, a_min, a_max, b_min, b_max) in enumerate(panels):
+        panel_x = margin + i * (panel_w + gap)
+        lines.append(f'<rect x="{panel_x}" y="{panel_y}" width="{panel_w}" height="{panel_h}" fill="#f9f9fb" stroke="#d8d8de"/>')
+        lines.append(f'<text x="{panel_x + panel_w/2}" y="{panel_y - 10}" text-anchor="middle" font-size="12" font-family="Arial">{label}</text>')
+
+        for j, (av, bv) in enumerate(zip(a_vals, b_vals)):
+            x, y = project_to_panel(av, bv, a_min, a_max, b_min, b_max, panel_x + 8, panel_y + 8, panel_w - 16, panel_h - 16)
+            lines.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="2.5" fill="#1f77b4" fill-opacity="0.9"/>')
+            if j % 10 == 0:
+                lines.append(f'<text x="{x + 3:.2f}" y="{y - 3:.2f}" font-size="8" fill="#444" font-family="Arial">{j}</text>')
+
+        lines.append(f'<text x="{panel_x + 6}" y="{panel_y + panel_h + 16}" font-size="10" fill="#666" font-family="Arial">min/max A: {a_min:.3f} / {a_max:.3f}</text>')
+        lines.append(f'<text x="{panel_x + 6}" y="{panel_y + panel_h + 30}" font-size="10" fill="#666" font-family="Arial">min/max B: {b_min:.3f} / {b_max:.3f}</text>')
+
+    lines.append("</svg>")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def save_kpt3d_perspective_svg(out_path: Path, points: list[tuple[float, float, float]], title: str) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not points:
+        out_path.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="420" height="420"><text x="20" y="40" font-size="16">No kpt3d points</text></svg>', encoding="utf-8")
+        return
+
+    width, height = 420, 420
+    cx, cy = width / 2, height / 2 + 10
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    zs = [p[2] for p in points]
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    mz = sum(zs) / len(zs)
+
+    rx = 25.0 * 3.141592653589793 / 180.0
+    ry = -35.0 * 3.141592653589793 / 180.0
+    cosx, sinx = math.cos(rx), math.sin(rx)
+    cosy, siny = math.cos(ry), math.sin(ry)
+    dist = 4.0
+
+    def to_view(x: float, y: float, z: float) -> tuple[float, float, float]:
+        x -= mx
+        y -= my
+        z -= mz
+
+        xr = x * cosy + z * siny
+        zr = -x * siny + z * cosy
+        yr = y * cosx - zr * sinx
+        zr2 = y * sinx + zr * cosx
+
+        denom = dist + zr2 * 0.35
+        if denom < 0.2:
+            denom = 0.2
+        ux = xr / denom
+        uy = yr / denom
+        return zr2, ux, uy
+
+    transformed: list[tuple[float, float, float, int]] = []
+    for idx, (x, y, z) in enumerate(points):
+        depth, ux, uy = to_view(x, y, z)
+        transformed.append((depth, ux, uy, idx))
+
+    x_span = max(xs) - min(xs)
+    y_span = max(ys) - min(ys)
+    z_span = max(zs) - min(zs)
+    axis_world_len = max(x_span, y_span, z_span) * 0.35
+    if axis_world_len < 1e-4:
+        axis_world_len = 0.2
+
+    axis_specs = [
+        ("X", axis_world_len, 0.0, 0.0, "#ff4d4f"),
+        ("Y", 0.0, axis_world_len, 0.0, "#22c55e"),
+        ("Z", 0.0, 0.0, axis_world_len, "#3b82f6"),
+    ]
+
+    axis_proj: list[tuple[str, str, float, float, float, float]] = []
+    o_depth, o_ux, o_uy = to_view(mx, my, mz)
+    for label, dx, dy, dz, color in axis_specs:
+        e_depth, e_ux, e_uy = to_view(mx + dx, my + dy, mz + dz)
+        axis_proj.append((label, color, o_ux, o_uy, e_ux, e_uy))
+
+    u_vals = [p[1] for p in transformed]
+    v_vals = [p[2] for p in transformed]
+    for _, _, su, sv, eu, ev in axis_proj:
+        u_vals.extend([su, eu])
+        v_vals.extend([sv, ev])
+    u_min, u_max = min(u_vals), max(u_vals)
+    v_min, v_max = min(v_vals), max(v_vals)
+    u_mid = 0.5 * (u_min + u_max)
+    v_mid = 0.5 * (v_min + v_max)
+
+    range_u = max(1e-6, u_max - u_min)
+    range_v = max(1e-6, v_max - v_min)
+    fit_scale_x = (width * 0.78) / range_u
+    fit_scale_y = (height * 0.72) / range_v
+    scale = min(fit_scale_x, fit_scale_y)
+
+    projected: list[tuple[float, float, float, int]] = []
+    for depth, ux, uy, idx in transformed:
+        px = cx + (ux - u_mid) * scale
+        py = cy - (uy - v_mid) * scale
+        projected.append((depth, px, py, idx))
+
+    axis_px: list[tuple[str, str, float, float, float, float]] = []
+    for label, color, su, sv, eu, ev in axis_proj:
+        sx = cx + (su - u_mid) * scale
+        sy = cy - (sv - v_mid) * scale
+        ex = cx + (eu - u_mid) * scale
+        ey = cy - (ev - v_mid) * scale
+        axis_px.append((label, color, sx, sy, ex, ey))
+
+    projected.sort(key=lambda item: item[0])
+
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{width/2}" y="28" text-anchor="middle" font-size="18" font-family="Arial">{svg_escape(title)}</text>',
+    ]
+
+    for label, color, sx, sy, ex, ey in axis_px:
+        lines.append(f'<line x1="{sx:.2f}" y1="{sy:.2f}" x2="{ex:.2f}" y2="{ey:.2f}" stroke="{color}" stroke-width="2.2"/>')
+        lines.append(f'<text x="{ex + 4:.2f}" y="{ey - 4:.2f}" font-size="12" fill="{color}" font-family="Arial">{label}</text>')
+
+    for depth, px, py, idx in projected:
+        tone = max(70, min(220, int(140 + depth * 35)))
+        color = f"rgb({tone},{min(255, tone + 20)},255)"
+        lines.append(f'<circle cx="{px:.2f}" cy="{py:.2f}" r="3.0" fill="{color}" fill-opacity="0.9"/>')
+        if idx % 10 == 0:
+            lines.append(f'<text x="{px + 3:.2f}" y="{py - 3:.2f}" font-size="8" fill="#444" font-family="Arial">{idx}</text>')
+
+    lines.append("</svg>")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def save_kpt3d_perspective_matlab(
+    out_png_path: Path,
+    out_script_path: Path,
+    points: list[tuple[float, float, float]],
+    title: str,
+    matlab_command: str,
+) -> tuple[bool, str | None]:
+    out_png_path.parent.mkdir(parents=True, exist_ok=True)
+    out_script_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not points:
+        return False, "no points"
+
+    def esc(s: str) -> str:
+        return s.replace("'", "''")
+
+    x_vals = "; ".join(f"{p[0]:.9f}" for p in points)
+    y_vals = "; ".join(f"{p[1]:.9f}" for p in points)
+    z_vals = "; ".join(f"{p[2]:.9f}" for p in points)
+
+    script = f"""
+X = [{x_vals}];
+Y = [{y_vals}];
+Z = [{z_vals}];
+
+fig = figure('Visible','off','Color','w','Position',[100,100,900,900]);
+scatter3(X, Y, Z, 22, [0.12 0.44 0.93], 'filled');
+hold on;
+
+mx = mean(X); my = mean(Y); mz = mean(Z);
+sx = max(X)-min(X); sy = max(Y)-min(Y); sz = max(Z)-min(Z);
+axis_len = max([sx, sy, sz]) * 0.35;
+if axis_len < 1e-4
+    axis_len = 0.2;
+end
+
+quiver3(mx, my, mz, axis_len, 0, 0, 0, 'LineWidth', 2.0, 'Color', [1.0 0.2 0.2]);
+quiver3(mx, my, mz, 0, axis_len, 0, 0, 'LineWidth', 2.0, 'Color', [0.1 0.75 0.2]);
+quiver3(mx, my, mz, 0, 0, axis_len, 0, 'LineWidth', 2.0, 'Color', [0.2 0.45 1.0]);
+text(mx+axis_len, my, mz, 'X', 'Color', [1.0 0.2 0.2], 'FontSize', 12, 'FontWeight', 'bold');
+text(mx, my+axis_len, mz, 'Y', 'Color', [0.1 0.75 0.2], 'FontSize', 12, 'FontWeight', 'bold');
+text(mx, my, mz+axis_len, 'Z', 'Color', [0.2 0.45 1.0], 'FontSize', 12, 'FontWeight', 'bold');
+
+xlabel('X'); ylabel('Y'); zlabel('Z');
+title('{esc(title)}', 'Interpreter', 'none');
+grid on;
+axis equal;
+view(35, 25);
+
+pad = max([sx, sy, sz]) * 0.15;
+if pad < 1e-4
+    pad = 0.05;
+end
+xlim([min(X)-pad, max(X)+pad]);
+ylim([min(Y)-pad, max(Y)+pad]);
+zlim([min(Z)-pad, max(Z)+pad]);
+
+exportgraphics(fig, '{esc(str(out_png_path.resolve()))}', 'Resolution', 220);
+close(fig);
+""".strip()
+
+    out_script_path.write_text(script, encoding="utf-8")
+
+    script_for_cmd = str(out_script_path.resolve()).replace("'", "''")
+    batch_cmd = [matlab_command, "-batch", f"run('{script_for_cmd}')"]
+    legacy_cmd = [matlab_command, "-nodisplay", "-nosplash", "-nodesktop", "-r", f"run('{script_for_cmd}');exit;"]
+
+    try:
+        proc = subprocess.run(batch_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        if proc.returncode == 0 and out_png_path.exists():
+            return True, None
+
+        proc2 = subprocess.run(legacy_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        if proc2.returncode == 0 and out_png_path.exists():
+            return True, None
+        return False, (proc2.stderr or proc.stderr or "matlab render failed").strip()
+    except FileNotFoundError:
+        return False, f"MATLAB command not found: {matlab_command}"
+    except subprocess.TimeoutExpired:
+        return False, "MATLAB render timeout"
+    except Exception as ex:
+        return False, str(ex)
+
+
 def save_kpt_overlay_svg(
     out_path: Path,
     image_path: Path,
@@ -447,6 +778,11 @@ def validate_action(
     viz_conf_threshold: float,
     viz_main_joint_indices: set[int] | None,
     viz_auto_filter_helper_joints: bool,
+    kpt3d_viz_root: Path,
+    kpt3d_viz_frames: int,
+    kpt3d_viz_all_frames: bool,
+    kpt3d_3d_backend: str,
+    matlab_command: str,
 ) -> ActionReport:
     action_dir = node.action_path
     report = ActionReport(action_name=node.action_name, action_path=str(action_dir), character_name=node.character_name)
@@ -473,10 +809,62 @@ def validate_action(
 
     kpt3d_npz = action_dir / "kpt3d" / "kpt3d.npz"
     report.has_kpt3d_npz = kpt3d_npz.exists()
+    selected_kpt3d_shape: list[int] | None = None
+    selected_kpt3d_data: list[float] | None = None
     if report.has_kpt3d_npz:
         report.kpt3d_npz_arrays = parse_npz_shapes(kpt3d_npz)
         if not report.kpt3d_npz_arrays:
             report.issues.append(Issue("ERROR", "action", "kpt3d.npz 存在但无法解析"))
+
+    if report.has_kpt3d_npy:
+        shp, data = parse_npy_float32_data(kpt3d_npy)
+        if shp and data is not None and len(shp) == 3 and shp[2] == 3:
+            selected_kpt3d_shape, selected_kpt3d_data = shp, data
+
+    if selected_kpt3d_data is None and report.has_kpt3d_npz:
+        npz_float_arrays = parse_npz_float32_arrays(kpt3d_npz)
+        preferred_names = ["kpt3d.npy", "kpt3d", "arr_0.npy", "arr_0"]
+        ordered_names = [n for n in preferred_names if n in npz_float_arrays] + [n for n in npz_float_arrays.keys() if n not in preferred_names]
+        for name in ordered_names:
+            shape, data = npz_float_arrays[name]
+            if len(shape) == 3 and shape[2] == 3:
+                selected_kpt3d_shape, selected_kpt3d_data = shape, data
+                break
+
+    if selected_kpt3d_shape and selected_kpt3d_data is not None and (kpt3d_viz_all_frames or kpt3d_viz_frames > 0):
+        safe_char = re.sub(r"[^A-Za-z0-9_.-]+", "_", node.character_name or "character")
+        safe_action = re.sub(r"[^A-Za-z0-9_.-]+", "_", report.action_name)
+        matlab_warned = False
+        if kpt3d_viz_all_frames:
+            frame_ids = list(range(selected_kpt3d_shape[0]))
+        else:
+            frame_ids = pick_frame_indices(selected_kpt3d_shape[0], kpt3d_viz_frames)
+        for fi in frame_ids:
+            pts3d = reshape_kpt3d_points(selected_kpt3d_shape, selected_kpt3d_data, fi)
+            base = kpt3d_viz_root / safe_char / safe_action / f"kpt3d_frame_{fi:06d}"
+
+            p3d_svg = base.with_name(base.name + "_3d").with_suffix(".svg")
+            p3d_png = base.with_name(base.name + "_3d").with_suffix(".png")
+            p3d_m = base.with_name(base.name + "_3d_render").with_suffix(".m")
+            p3views = base.with_name(base.name + "_3views").with_suffix(".svg")
+
+            title_3d = f"{report.action_name} | kpt3d frame {fi:06d} | 3D"
+            if kpt3d_3d_backend == "matlab":
+                ok, err = save_kpt3d_perspective_matlab(p3d_png, p3d_m, pts3d, title_3d, matlab_command)
+                if ok:
+                    report.kpt3d_visuals.append(str(p3d_png))
+                else:
+                    if not matlab_warned:
+                        report.issues.append(Issue("WARN", "action", f"MATLAB 3D render unavailable: {err}; fallback to SVG for remaining frames"))
+                        matlab_warned = True
+                    save_kpt3d_perspective_svg(p3d_svg, pts3d, title_3d)
+                    report.kpt3d_visuals.append(str(p3d_svg))
+            else:
+                save_kpt3d_perspective_svg(p3d_svg, pts3d, title_3d)
+                report.kpt3d_visuals.append(str(p3d_svg))
+
+            save_kpt3d_three_views_svg(p3views, pts3d, f"{report.action_name} | kpt3d frame {fi:06d} | XY/XZ/YZ")
+            report.kpt3d_visuals.append(str(p3views))
 
     camera_ids: set[str] = set()
     frames_root = action_dir / "frames"
@@ -813,6 +1201,9 @@ def generate_visuals(report: FullReport, output_dir: Path) -> list[str]:
             if cam.overlay_svg:
                 generated.append(cam.overlay_svg)
 
+        for p in action.kpt3d_visuals:
+            generated.append(p)
+
     return generated
 
 
@@ -856,6 +1247,9 @@ def to_markdown(report: FullReport) -> str:
 
         lines.append(f"- kpt3d.npy: {'Y' if action.has_kpt3d_npy else 'N'} shape={tuple(action.kpt3d_shape) if action.kpt3d_shape else '-'}")
         lines.append(f"- kpt3d.npz: {'Y' if action.has_kpt3d_npz else 'N'} arrays={list(action.kpt3d_npz_arrays.keys()) if action.kpt3d_npz_arrays else []}")
+        lines.append(f"- kpt3d visuals: {len(action.kpt3d_visuals)}")
+        for p in action.kpt3d_visuals:
+            lines.append(f"  - {p}")
 
         frame_counts = [c.frame_count for c in action.camera_reports]
         if frame_counts:
@@ -915,6 +1309,7 @@ def main() -> int:
     else:
         overlay_dir = output_dir / "figures" / "overlays"
         overlay_all_root = output_dir / "figures" / "overlays_all"
+        kpt3d_viz_root = output_dir / "figures" / "kpt3d"
         actions = [
             validate_action(
                 n,
@@ -927,6 +1322,11 @@ def main() -> int:
                 args.viz_conf_threshold,
                 viz_main_joint_indices,
                 args.viz_auto_filter_helper_joints,
+                kpt3d_viz_root,
+                args.kpt3d_viz_frames,
+                args.kpt3d_viz_all_frames,
+                args.kpt3d_3d_backend,
+                args.matlab_command,
             )
             for n in nodes
         ]
