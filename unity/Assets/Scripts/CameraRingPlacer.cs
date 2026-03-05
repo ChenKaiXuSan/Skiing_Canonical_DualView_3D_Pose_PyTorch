@@ -1,9 +1,15 @@
 using System.Collections.Generic;
-using System.IO;
 using UnityEngine;
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
 
 public class CameraRingPlacer : MonoBehaviour
 {
+    const string CaptureFolderPrefixDefault = "capture";
+    const string ImagePrefixDefault = "frame";
+    const string KptPrefixDefault = "kpt2d";
+
     [Header("Character (Auto Assign)")]
     public Transform target;
     public Animator targetAnimator;
@@ -65,6 +71,9 @@ public class CameraRingPlacer : MonoBehaviour
             return;
         }
 
+        if (targetAnimator == null)
+            targetAnimator = target.GetComponentInChildren<Animator>();
+
         // 1) Resolve joints ONCE
         Transform[] resolvedJoints = null;
         if (attachCaptureScript)
@@ -81,17 +90,14 @@ public class CameraRingPlacer : MonoBehaviour
         Vector3 center = (centerTransform != null ? centerTransform.position : target.position) + lookAtOffset;
 
         // 2) Parent
-        GameObject parent = GameObject.Find(parentName);
-        if (parent == null) parent = new GameObject(parentName);
+        GameObject parent = GetOrCreateParent(parentName);
 
         if (clearExisting)
-        {
-            for (int i = parent.transform.childCount - 1; i >= 0; --i)
-                DestroyImmediate(parent.transform.GetChild(i).gameObject);
-        }
+            ClearExistingChildren(parent.transform);
 
         int validStepDeg = Mathf.Max(1, stepDeg);
         int anglesCount = Mathf.CeilToInt(360f / validStepDeg);
+        float stepRad = validStepDeg * Mathf.Deg2Rad;
 
         int pitchCount = pitchAngles != null ? pitchAngles.Length : 0;
 
@@ -113,7 +119,7 @@ public class CameraRingPlacer : MonoBehaviour
             for (int i = 0; i < anglesCount; i++)
             {
                 float yawDeg = i * validStepDeg;
-                float yawRad = yawDeg * Mathf.Deg2Rad;
+                float yawRad = i * stepRad;
 
                 Vector3 dir = new Vector3(
                     Mathf.Sin(yawRad) * cosPitch,
@@ -124,75 +130,22 @@ public class CameraRingPlacer : MonoBehaviour
                 Vector3 pos = center + dir * radius;
 
                 string camId = $"L{p}_A{yawDeg:000}";
-                GameObject camGo = new GameObject(camId);
-                camGo.transform.SetParent(parent.transform);
-                camGo.transform.position = pos;
-                camGo.transform.LookAt(center);
-
+                GameObject camGo = CreateCameraObject(parent.transform, camId, pos, center);
                 Camera cam = camGo.AddComponent<Camera>();
-
-                // ===== 相机参数：匹配你截图 =====
-                cam.clearFlags = CameraClearFlags.SolidColor;
-                cam.backgroundColor = Color.black;
-                cam.cullingMask = ~0;
-                cam.orthographic = false;
-                cam.fieldOfView = fov;
-                cam.nearClipPlane = nearClip;
-                cam.farClipPlane = farClip;
-                cam.rect = new Rect(0, 0, 1, 1);
-                cam.depth = cameraDepth;
-                cam.renderingPath = RenderingPath.UsePlayerSettings;
-                cam.useOcclusionCulling = true;
-                cam.allowHDR = true;
-                cam.allowMSAA = true;
-                cam.targetTexture = null;
-                cam.targetDisplay = targetDisplay;
-
-                // ✅ 重要：先禁用，避免场景里多相机渲染干扰
-                cam.enabled = false;
+                ConfigureCamera(cam);
 
                 // ===== 自动挂载采集脚本（OneCameraCaptureFrame） =====
                 if (attachCaptureScript)
                 {
-                    var cap = camGo.AddComponent<OneCameraCaptureFrame>();
-
-                    // 绑定相机 & 人物
-                    cap.cam = cam;
-                    cap.target = target;
-                    cap.targetAnimator = targetAnimator;
-
-                    // ✅ 关节点：直接塞进去，保证所有相机一致（且不会重复扫描）
-                    cap.rootBone = rootBone;
-                    cap.autoScanAllChildren = true; // 让它扫描，但我们会覆盖 joints
-                    cap.joints = resolvedJoints;
-
-                    // ✅ 不要每台都自动跑
-                    cap.autoRunOnPlay = autoRunOnPlay;
-
-                    // 数据集相机ID
-                    cap.cameraId = camId;
-
-                    // 数据集根目录（具体相机子目录由 capture 脚本内部组织）
-                    cap.outRootFolder = outRootFolder;
-                    cap.subjectId = subjectId;
-                    cap.actionId = actionId;
-                    cap.characterFolderName = subjectId;
-                    cap.autoUseTargetNameAsCharacterFolder = false;
-                    cap.useClipNameAsActionFolder = true;
-                    cap.splitOutputByClip = false;
-
-                    // 前缀
-                    cap.captureFolderPrefix = "capture";
-                    cap.imagePrefix = "frame";
-                    cap.kptPrefix = "kpt2d";
-
-                    // 我们这里已经设置好了 Camera 参数
-                    cap.applyInspectorLikePreset = false;
+                    AttachCaptureComponent(camGo, cam, camId, resolvedJoints);
                 }
 
                 createdCount++;
             }
         }
+
+        if (attachCaptureScript && createdCount > 0)
+            OneCameraCaptureFrame.ConfigureGlobalSyncParticipants(createdCount);
 
         Debug.Log($"[CameraRingPlacer] Created {createdCount} cameras (1 radius x {pitchCount} pitches x {anglesCount} angles, center={(centerTransform != null ? centerTransform.name : target.name)}, enabled=false) + attached capture={attachCaptureScript}");
     }
@@ -214,6 +167,101 @@ public class CameraRingPlacer : MonoBehaviour
         }
 
         return target;
+    }
+
+    GameObject GetOrCreateParent(string name)
+    {
+        GameObject parent = GameObject.Find(name);
+        if (parent != null) return parent;
+
+        parent = new GameObject(name);
+#if UNITY_EDITOR
+        Undo.RegisterCreatedObjectUndo(parent, "Create Camera Ring Parent");
+#endif
+        return parent;
+    }
+
+    void ClearExistingChildren(Transform parent)
+    {
+#if UNITY_EDITOR
+        Transform selected = Selection.activeTransform;
+        if (selected != null && selected.IsChildOf(parent))
+            Selection.activeGameObject = parent.gameObject;
+#endif
+
+        for (int i = parent.childCount - 1; i >= 0; --i)
+        {
+            GameObject childGo = parent.GetChild(i).gameObject;
+#if UNITY_EDITOR
+            Undo.DestroyObjectImmediate(childGo);
+#else
+            DestroyImmediate(childGo);
+#endif
+        }
+    }
+
+    GameObject CreateCameraObject(Transform parent, string camId, Vector3 worldPos, Vector3 lookAt)
+    {
+        GameObject camGo = new GameObject(camId);
+#if UNITY_EDITOR
+        Undo.RegisterCreatedObjectUndo(camGo, "Create Ring Camera");
+#endif
+        camGo.transform.SetParent(parent);
+        camGo.transform.position = worldPos;
+        camGo.transform.LookAt(lookAt);
+        return camGo;
+    }
+
+    void ConfigureCamera(Camera cam)
+    {
+        cam.clearFlags = CameraClearFlags.SolidColor;
+        cam.backgroundColor = Color.black;
+        cam.cullingMask = ~0;
+        cam.orthographic = false;
+        cam.fieldOfView = fov;
+        cam.nearClipPlane = nearClip;
+        cam.farClipPlane = farClip;
+        cam.rect = new Rect(0, 0, 1, 1);
+        cam.depth = cameraDepth;
+        cam.renderingPath = RenderingPath.UsePlayerSettings;
+        cam.useOcclusionCulling = true;
+        cam.allowHDR = true;
+        cam.allowMSAA = true;
+        cam.targetTexture = null;
+        cam.targetDisplay = targetDisplay;
+        cam.enabled = false;
+    }
+
+    void AttachCaptureComponent(GameObject camGo, Camera cam, string camId, Transform[] resolvedJoints)
+    {
+        var cap = camGo.AddComponent<OneCameraCaptureFrame>();
+
+        cap.cam = cam;
+        cap.target = target;
+        cap.targetAnimator = targetAnimator;
+
+        // Keep full-joint capture consistent across all cameras.
+        cap.rootBone = rootBone;
+        // We already provide a resolved joints array; disable autoscan to avoid overriding order/content in Start().
+        cap.autoScanAllChildren = false;
+        cap.joints = resolvedJoints;
+
+        cap.autoRunOnPlay = autoRunOnPlay;
+        cap.cameraId = camId;
+
+        cap.outRootFolder = outRootFolder;
+        cap.subjectId = subjectId;
+        cap.actionId = actionId;
+        cap.characterFolderName = subjectId;
+        cap.autoUseTargetNameAsCharacterFolder = false;
+        cap.useClipNameAsActionFolder = true;
+        cap.splitOutputByClip = false;
+
+        cap.captureFolderPrefix = CaptureFolderPrefixDefault;
+        cap.imagePrefix = ImagePrefixDefault;
+        cap.kptPrefix = KptPrefixDefault;
+
+        cap.applyInspectorLikePreset = false;
     }
 
     Transform[] ResolveJointsOnce()

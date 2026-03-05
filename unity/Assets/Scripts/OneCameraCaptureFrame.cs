@@ -87,10 +87,68 @@ namespace PoseRecord.Data
         public int camera_count;
         public string[] camera_ids;
     }
+
+    [Serializable]
+    public class JointNamesData
+    {
+        public string[] joint_names;
+    }
 }
 
 public class OneCameraCaptureFrame : MonoBehaviour
 {
+    static class GlobalFrameSync
+    {
+        public static int expectedParticipants = 1;
+        public static int registeredParticipants = 0;
+        public static int currentStep = 0;
+        public static int arrivedAtStep = 0;
+        public static int generation = 0;
+
+        public static void Configure(int participants)
+        {
+            expectedParticipants = Mathf.Max(1, participants);
+            registeredParticipants = 0;
+            currentStep = 0;
+            arrivedAtStep = 0;
+            generation = 0;
+        }
+
+        public static void Register()
+        {
+            registeredParticipants++;
+        }
+
+        public static void Unregister()
+        {
+            registeredParticipants = Mathf.Max(0, registeredParticipants - 1);
+            if (registeredParticipants == 0)
+            {
+                currentStep = 0;
+                arrivedAtStep = 0;
+                generation = 0;
+            }
+        }
+
+        public static void Arrive(int step)
+        {
+            if (step != currentStep) return;
+            arrivedAtStep++;
+            if (arrivedAtStep >= expectedParticipants)
+            {
+                arrivedAtStep = 0;
+                currentStep++;
+                generation++;
+            }
+        }
+    }
+
+    public static void ConfigureGlobalSyncParticipants(int participants)
+    {
+        GlobalFrameSync.Configure(participants);
+        Debug.Log($"[OneCameraCaptureFrame] Global frame sync configured: participants={Mathf.Max(1, participants)}");
+    }
+
     struct ClipSegment
     {
         public AnimationClip clip;
@@ -105,6 +163,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
         public string metaFolder;
         public string cameraFolder;
         public string imageFolder;
+        public string vizFolder;
         public string kpt2dFolder;
         public string kpt2dPath;
         public string kpt3dPath;
@@ -136,6 +195,9 @@ public class OneCameraCaptureFrame : MonoBehaviour
     public string imagePrefix = "frame";
     [Tooltip("2D 关键点 npy 文件名前缀，例如 kpt2d.npy")]
     public string kptPrefix = "kpt2d";
+
+    [Tooltip("可视化图片文件名前缀（仅用于可视化输出目录）")]
+    public string vizImagePrefix = "viz";
 
     [Tooltip("写出全相机共享的3D关键点（kpt3d/kpt3d.npy），若已存在则默认跳过")]
     public bool exportSharedKpt3d = true;
@@ -200,6 +262,16 @@ public class OneCameraCaptureFrame : MonoBehaviour
     [Tooltip("是否在数据集根目录生成/刷新 dataset_manifest.json")]
     public bool exportDatasetManifest = true;
 
+    [Tooltip("在每个动作的 meta 目录导出 joint_names.json（用于可视化筛选）")]
+    public bool exportJointNamesMeta = true;
+
+    [Header("Cross-Camera Frame Sync")]
+    [Tooltip("开启后：所有相机在每个采样 step 上同步，保证同一帧采样后再进入下一帧")]
+    public bool enableGlobalFrameSync = true;
+
+    [Tooltip("等待所有相机注册的最大秒数（超时则继续，避免死等）")]
+    public float globalSyncWaitTimeoutSec = 10f;
+
     [Header("NPZ Export")]
     [Tooltip("同时导出 2D 关键点 npz（与 npy 并存）")]
     public bool exportKpt2dNpz = true;
@@ -210,6 +282,13 @@ public class OneCameraCaptureFrame : MonoBehaviour
     // 新增：每帧单独导出 kpt2d npy
     [Tooltip("每帧单独导出 2D 关键点 npy 到 kpt2d 文件夹")]
     public bool exportKpt2dPerFrame = true;
+
+    [Header("Visualization Export")]
+    [Tooltip("同时导出每帧可视化图片（将 kpt2d 叠加在 frame 上）")]
+    public bool exportKpt2dOverlayImage = true;
+
+    [Tooltip("可视化关键点半径（像素）")]
+    public int vizPointRadius = 3;
 
     // session
     private float baseTime;
@@ -225,104 +304,116 @@ public class OneCameraCaptureFrame : MonoBehaviour
     {
         IsCaptureStarted = true;
         IsCaptureDone = false;
-
-        if (!autoRunOnPlay) yield break;
-
-        if (cam == null) cam = GetComponent<Camera>();
-        if (cam == null)
+        bool syncRegistered = false;
+        try
         {
-            Debug.LogError("[OneCameraCaptureFrame] Camera is null.");
-            yield break;
-        }
+            if (!autoRunOnPlay) yield break;
 
-        if (string.IsNullOrWhiteSpace(cameraId))
-            cameraId = cam.name;
-
-        if (target == null)
-        {
-            Debug.LogError("[OneCameraCaptureFrame] target is null.");
-            yield break;
-        }
-
-        if (applyInspectorLikePreset)
-            ApplyCameraPresetLikeInspector();
-
-        // resolve joints
-        if (autoScanAllChildren && rootBone != null)
-        {
-            var list = new List<Transform>();
-            var smr = rootBone.GetComponentInChildren<SkinnedMeshRenderer>();
-            if (smr != null && smr.bones != null && smr.bones.Length > 0)
-                list.AddRange(smr.bones);
-            else
+            if (cam == null) cam = GetComponent<Camera>();
+            if (cam == null)
             {
-                list.Add(rootBone);
-                GetAllChildren(rootBone, list);
+                Debug.LogError("[OneCameraCaptureFrame] Camera is null.");
+                yield break;
             }
-            joints = list.ToArray();
-        }
 
-        if (joints == null || joints.Length == 0)
+            if (string.IsNullOrWhiteSpace(cameraId))
+                cameraId = cam.name;
+
+            if (enableGlobalFrameSync)
+            {
+                GlobalFrameSync.Register();
+                syncRegistered = true;
+                yield return StartCoroutine(WaitForGlobalSyncReady());
+            }
+
+            if (target == null)
+            {
+                Debug.LogError("[OneCameraCaptureFrame] target is null.");
+                yield break;
+            }
+
+            if (applyInspectorLikePreset)
+                ApplyCameraPresetLikeInspector();
+
+            // resolve joints
+            if (autoScanAllChildren && rootBone != null)
+            {
+                var list = new List<Transform>();
+                var smr = rootBone.GetComponentInChildren<SkinnedMeshRenderer>();
+                if (smr != null && smr.bones != null && smr.bones.Length > 0)
+                    list.AddRange(smr.bones);
+                else
+                {
+                    list.Add(rootBone);
+                    GetAllChildren(rootBone, list);
+                }
+                joints = list.ToArray();
+            }
+
+            if (joints == null || joints.Length == 0)
+            {
+                Debug.LogError("[OneCameraCaptureFrame] joints is empty.");
+                yield break;
+            }
+
+            if (startDelaySec > 0f)
+                yield return new WaitForSeconds(startDelaySec);
+
+            if (targetAnimator == null) targetAnimator = target.GetComponentInChildren<Animator>();
+            if (targetAnimator == null)
+            {
+                Debug.LogError("[OneCameraCaptureFrame] targetAnimator is null.");
+                yield break;
+            }
+
+            RuntimeAnimatorController ac = targetAnimator.runtimeAnimatorController;
+            if (ac == null)
+            {
+                Debug.LogError("[OneCameraCaptureFrame] targetAnimator.runtimeAnimatorController is null.");
+                yield break;
+            }
+
+            targetAnimator.enabled = true;
+            targetAnimator.Update(0f);
+
+            AnimationClip captureClip = null;
+            var currentClips = targetAnimator.GetCurrentAnimatorClipInfo(animatorLayer);
+            if (currentClips != null && currentClips.Length > 0)
+                captureClip = currentClips[0].clip;
+            if (captureClip == null && ac.animationClips != null && ac.animationClips.Length > 0)
+                captureClip = ac.animationClips[0];
+
+            if (captureClip == null)
+            {
+                Debug.LogError("[OneCameraCaptureFrame] no valid AnimationClip found for sampling.");
+                yield break;
+            }
+
+            var controllerClips = GetUniqueControllerClips(ac);
+            var clipSegments = BuildClipSegments(sampleAllControllerClips ? controllerClips : new List<AnimationClip> { captureClip });
+
+            int totalFrames = GetTotalFramesFromSegments(clipSegments);
+            if (logControllerClipSummary)
+                LogClipSegmentsSummary(clipSegments, sampleAllControllerClips ? "ControllerAllClips" : "CurrentClipOnly");
+
+            if (totalFrames <= 0)
+            {
+                Debug.LogError("[OneCameraCaptureFrame] totalFrames <= 0，无法采样。");
+                yield break;
+            }
+
+            string resolvedCharacterFolder = ResolveCharacterFolderName();
+
+            baseTime = Time.time;
+            yield return StartCoroutine(CaptureSequence(totalFrames, clipSegments, resolvedCharacterFolder));
+
+            IsCaptureDone = true;
+        }
+        finally
         {
-            Debug.LogError("[OneCameraCaptureFrame] joints is empty.");
-            yield break;
+            if (syncRegistered)
+                GlobalFrameSync.Unregister();
         }
-
-        if (startDelaySec > 0f)
-            yield return new WaitForSeconds(startDelaySec);
-
-        if (targetAnimator == null) targetAnimator = target.GetComponentInChildren<Animator>();
-        if (targetAnimator == null)
-        {
-            Debug.LogError("[OneCameraCaptureFrame] targetAnimator is null.");
-            yield break;
-        }
-
-        // get total frames
-        RuntimeAnimatorController ac = targetAnimator.runtimeAnimatorController;
-        if (ac == null)
-        {
-            Debug.LogError("[OneCameraCaptureFrame] targetAnimator.runtimeAnimatorController is null.");
-            yield break;
-        }
-
-        targetAnimator.enabled = true;
-        targetAnimator.Update(0f);
-
-        AnimationClip captureClip = null;
-        var currentClips = targetAnimator.GetCurrentAnimatorClipInfo(animatorLayer);
-        if (currentClips != null && currentClips.Length > 0)
-            captureClip = currentClips[0].clip;
-        if (captureClip == null && ac.animationClips != null && ac.animationClips.Length > 0)
-            captureClip = ac.animationClips[0];
-
-        if (captureClip == null)
-        {
-            Debug.LogError("[OneCameraCaptureFrame] no valid AnimationClip found for sampling.");
-            yield break;
-        }
-
-        var controllerClips = GetUniqueControllerClips(ac);
-        var clipSegments = BuildClipSegments(sampleAllControllerClips ? controllerClips : new List<AnimationClip> { captureClip });
-
-        int totalFrames = GetTotalFramesFromSegments(clipSegments);
-        if (logControllerClipSummary)
-            LogClipSegmentsSummary(clipSegments, sampleAllControllerClips ? "ControllerAllClips" : "CurrentClipOnly");
-
-        if (totalFrames <= 0)
-        {
-            Debug.LogError("[OneCameraCaptureFrame] totalFrames <= 0，无法采样。");
-            yield break;
-        }
-
-        string resolvedCharacterFolder = ResolveCharacterFolderName();
-
-        baseTime = Time.time;
-        yield return StartCoroutine(CaptureSequence(totalFrames, clipSegments, resolvedCharacterFolder));
-
-        IsCaptureDone = true;
-
-        // 结束之后退出
     }
 
     IEnumerator CaptureSequence(int totalFrames, List<ClipSegment> clipSegments, string characterFolder)
@@ -360,6 +451,13 @@ public class OneCameraCaptureFrame : MonoBehaviour
         rt.Create();
         tex = new Texture2D(captureWidth, captureHeight, TextureFormat.RGBA32, false);
 
+        // Keep camera projection and render target geometry aligned with the capture RT.
+        cam.targetTexture = rt;
+        cam.rect = new Rect(0f, 0f, 1f, 1f);
+        cam.aspect = rt.width / (float)rt.height;
+        cam.ResetProjectionMatrix();
+        cam.targetTexture = null;
+
         int stride = forceEveryFrame ? 1 : Mathf.Max(1, poseEveryNFrames);
 
         // record template
@@ -384,6 +482,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
             string metaFolder = Path.Combine(actionRoot, "meta");
             string cameraFolder = Path.Combine(actionRoot, "cameras", cameraId);
             string imageFolder = Path.Combine(actionRoot, "frames", captureFolderName);
+            string vizFolder = Path.Combine(actionRoot, "viz", captureFolderName);
             string kpt2dFolder = Path.Combine(actionRoot, "kpt2d", safeCameraIdForKpt2d);
             string kpt3dFolder = Path.Combine(actionRoot, "kpt3d");
             string kpt2dPath = Path.Combine(kpt2dFolder, kpt2dFileName);
@@ -391,6 +490,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
 
             Directory.CreateDirectory(metaFolder);
             Directory.CreateDirectory(imageFolder);
+            if (exportKpt2dOverlayImage) Directory.CreateDirectory(vizFolder);
             Directory.CreateDirectory(kpt2dFolder);
             Directory.CreateDirectory(kpt3dFolder);
 
@@ -408,6 +508,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
                 metaFolder = metaFolder,
                 cameraFolder = cameraFolder,
                 imageFolder = imageFolder,
+                vizFolder = vizFolder,
                 kpt2dFolder = kpt2dFolder,
                 kpt2dPath = kpt2dPath,
                 kpt3dPath = kpt3dPath,
@@ -418,6 +519,8 @@ public class OneCameraCaptureFrame : MonoBehaviour
             };
 
             WriteSequenceMeta(Path.Combine(metaFolder, "sequence.json"), safeActionName, state.totalFrames, 0, stride);
+            if (exportJointNamesMeta)
+                WriteJointNamesMeta(Path.Combine(metaFolder, "joint_names.json"));
             actionStates.Add(safeActionName, state);
 
             Debug.Log($"[OneCameraCaptureFrame] Output camera folder: {imageFolder}");
@@ -425,9 +528,13 @@ public class OneCameraCaptureFrame : MonoBehaviour
         }
 
         int outputFrameIdx = 0;
+        int globalStep = 0;
 
         for (int sampleIdx = 0; sampleIdx < totalFrames; sampleIdx += stride)
         {
+            if (enableGlobalFrameSync)
+                yield return StartCoroutine(WaitForGlobalStep(globalStep));
+
             if (targetAnimator && clipSegments != null && clipSegments.Count > 0)
                 FreezeAnimatorAtSample(clipSegments, sampleIdx, totalFrames);
 
@@ -442,6 +549,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
                 sampleIdx,
                 state.sampledFrames,
                 state.imageFolder,
+                state.vizFolder,
                 imagePrefix,
                 state.kpt2dFolder,
                 kptPrefix,       // 新增
@@ -454,12 +562,21 @@ public class OneCameraCaptureFrame : MonoBehaviour
                 AppendKpt3DWorldTJC3(state.kpt3dBuffer);
 
             outputFrameIdx++;
+
+            if (enableGlobalFrameSync)
+            {
+                yield return StartCoroutine(ArriveAndWaitGlobalStep(globalStep));
+                globalStep++;
+            }
         }
 
         int lastFrameIdx = Mathf.Max(0, totalFrames - 1);
         bool lastFrameAlreadyCaptured = (lastFrameIdx % stride == 0);
         if (!lastFrameAlreadyCaptured)
         {
+            if (enableGlobalFrameSync)
+                yield return StartCoroutine(WaitForGlobalStep(globalStep));
+
             if (targetAnimator && clipSegments != null && clipSegments.Count > 0)
                 FreezeAnimatorAtSample(clipSegments, lastFrameIdx, totalFrames);
 
@@ -473,6 +590,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
                 lastFrameIdx,
                 state.sampledFrames,
                 state.imageFolder,
+                state.vizFolder,
                 imagePrefix,
                 state.kpt2dFolder,
                 kptPrefix,
@@ -485,6 +603,12 @@ public class OneCameraCaptureFrame : MonoBehaviour
                 AppendKpt3DWorldTJC3(state.kpt3dBuffer);
 
             outputFrameIdx++;
+
+            if (enableGlobalFrameSync)
+            {
+                yield return StartCoroutine(ArriveAndWaitGlobalStep(globalStep));
+                globalStep++;
+            }
         }
 
         foreach (var kv in actionStates)
@@ -514,6 +638,34 @@ public class OneCameraCaptureFrame : MonoBehaviour
         Destroy(tex);
 
         Debug.Log("[OneCameraCaptureFrame] Done.");
+    }
+
+    IEnumerator WaitForGlobalSyncReady()
+    {
+        float begin = Time.realtimeSinceStartup;
+        while (GlobalFrameSync.registeredParticipants < GlobalFrameSync.expectedParticipants)
+        {
+            if (globalSyncWaitTimeoutSec > 0f && Time.realtimeSinceStartup - begin > globalSyncWaitTimeoutSec)
+            {
+                Debug.LogWarning($"[OneCameraCaptureFrame] Global sync ready timeout. registered={GlobalFrameSync.registeredParticipants}, expected={GlobalFrameSync.expectedParticipants}");
+                yield break;
+            }
+            yield return null;
+        }
+    }
+
+    IEnumerator WaitForGlobalStep(int step)
+    {
+        while (GlobalFrameSync.currentStep < step)
+            yield return null;
+    }
+
+    IEnumerator ArriveAndWaitGlobalStep(int step)
+    {
+        int gen = GlobalFrameSync.generation;
+        GlobalFrameSync.Arrive(step);
+        while (GlobalFrameSync.generation == gen)
+            yield return null;
     }
 
     void FreezeAnimatorAtSample(List<ClipSegment> clipSegments, int sampleIdx, int totalFrames)
@@ -628,6 +780,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
         int frameIdx,
         int outputFrameIdx,
         string imageFolder,
+        string vizFolder,
         string imgPrefix,
         string kpt2dFolder,     // 新增
         string kptPrefixName,   // 新增
@@ -652,14 +805,15 @@ public class OneCameraCaptureFrame : MonoBehaviour
         }
 
         cam.targetTexture = rt;
-        yield return new WaitForEndOfFrame();
         cam.Render();
 
         try
         {
+            int w = rt.width;
+            int h = rt.height;
             var prev = RenderTexture.active;
             RenderTexture.active = rt;
-            tex.ReadPixels(new Rect(0, 0, captureWidth, captureHeight), 0, 0, false);
+            tex.ReadPixels(new Rect(0, 0, w, h), 0, 0, false);
             tex.Apply(false, false);
             RenderTexture.active = prev;
 
@@ -693,11 +847,98 @@ public class OneCameraCaptureFrame : MonoBehaviour
             string safeKptPrefix = string.IsNullOrWhiteSpace(kptPrefixName) ? "kpt2d" : kptPrefixName;
             string perFramePath = Path.Combine(kpt2dFolder, $"{safeKptPrefix}_{outputFrameIdx:000000}.npy");
             WriteNpyFloat32_2D(perFramePath, oneFrame, joints.Length, 3);
+
+            if (exportKpt2dOverlayImage)
+            {
+                string safeVizPrefix = string.IsNullOrWhiteSpace(vizImagePrefix) ? "viz" : vizImagePrefix;
+                string vizPath = Path.Combine(vizFolder, $"{safeVizPrefix}_{outputFrameIdx:000000}.png");
+                SaveOverlayVisualization(vizPath, oneFrame, joints.Length);
+            }
+        }
+        else if (exportKpt2dOverlayImage)
+        {
+            int count = joints.Length * 3;
+            float[] oneFrame = new float[count];
+            for (int i = 0; i < count; i++) oneFrame[i] = kpt2dBuffer[start + i];
+
+            string safeVizPrefix = string.IsNullOrWhiteSpace(vizImagePrefix) ? "viz" : vizImagePrefix;
+            string vizPath = Path.Combine(vizFolder, $"{safeVizPrefix}_{outputFrameIdx:000000}.png");
+            SaveOverlayVisualization(vizPath, oneFrame, joints.Length);
+        }
+    }
+
+    void SaveOverlayVisualization(string path, float[] frameKpt, int jointCount)
+    {
+        if (tex == null || frameKpt == null || jointCount <= 0) return;
+
+        int w = rt != null ? rt.width : captureWidth;
+        int h = rt != null ? rt.height : captureHeight;
+
+        Color32[] src = tex.GetPixels32();
+        Color32[] dst = new Color32[src.Length];
+        Array.Copy(src, dst, src.Length);
+
+        int radius = Mathf.Max(1, vizPointRadius);
+        for (int i = 0; i < jointCount; i++)
+        {
+            int baseIdx = i * 3;
+            float x = frameKpt[baseIdx + 0];
+            float y = frameKpt[baseIdx + 1];
+            float c = frameKpt[baseIdx + 2];
+            if (c <= 0f) continue;
+
+            int px = Mathf.RoundToInt(x);
+            int py = Mathf.RoundToInt(y);
+            // frameKpt uses top-left origin when flipYToTopLeft=true, but Texture2D pixels are bottom-left origin.
+            if (flipYToTopLeft)
+                py = (h - 1) - py;
+
+            DrawCircle(dst, w, h, px, py, radius, new Color32(0, 255, 102, 255));
+        }
+
+        var vizTex = new Texture2D(w, h, TextureFormat.RGBA32, false);
+        vizTex.SetPixels32(dst);
+        vizTex.Apply(false, false);
+
+        try
+        {
+            File.WriteAllBytes(path, vizTex.EncodeToPNG());
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[OneCameraCaptureFrame] Failed to save viz PNG: {path}\n{ex}");
+        }
+        finally
+        {
+            Destroy(vizTex);
+        }
+    }
+
+    static void DrawCircle(Color32[] pixels, int width, int height, int cx, int cy, int radius, Color32 color)
+    {
+        int rr = radius * radius;
+        int xMin = Mathf.Max(0, cx - radius);
+        int xMax = Mathf.Min(width - 1, cx + radius);
+        int yMin = Mathf.Max(0, cy - radius);
+        int yMax = Mathf.Min(height - 1, cy + radius);
+
+        for (int y = yMin; y <= yMax; y++)
+        {
+            int dy = y - cy;
+            for (int x = xMin; x <= xMax; x++)
+            {
+                int dx = x - cx;
+                if (dx * dx + dy * dy > rr) continue;
+                pixels[y * width + x] = color;
+            }
         }
     }
 
     void AppendKeypointsAsPixelTJC3(List<float> outBuffer)
     {
+        int w = rt != null ? rt.width : captureWidth;
+        int h = rt != null ? rt.height : captureHeight;
+
         for (int i = 0; i < joints.Length; i++)
         {
             Vector3 vp = cam.WorldToViewportPoint(joints[i].position);
@@ -706,8 +947,8 @@ public class OneCameraCaptureFrame : MonoBehaviour
             float x01 = flipX ? 1f - vp.x : vp.x;
             float y01 = flipYToTopLeft ? 1f - vp.y : vp.y;
 
-            float x = x01 * (captureWidth - 1);
-            float y = y01 * (captureHeight - 1);
+            float x = x01 * (w - 1);
+            float y = y01 * (h - 1);
 
             outBuffer.Add(x);
             outBuffer.Add(y);
@@ -733,6 +974,22 @@ public class OneCameraCaptureFrame : MonoBehaviour
         };
 
         File.WriteAllText(path, JsonUtility.ToJson(seq, true), Encoding.UTF8);
+    }
+
+    void WriteJointNamesMeta(string path)
+    {
+        if (joints == null || joints.Length == 0) return;
+
+        var names = new string[joints.Length];
+        for (int i = 0; i < joints.Length; i++)
+            names[i] = joints[i] != null ? joints[i].name : $"joint_{i}";
+
+        var data = new PoseRecord.Data.JointNamesData
+        {
+            joint_names = names
+        };
+
+        File.WriteAllText(path, JsonUtility.ToJson(data, true), Encoding.UTF8);
     }
 
     string ResolveActionFolderName(AnimationClip captureClip)

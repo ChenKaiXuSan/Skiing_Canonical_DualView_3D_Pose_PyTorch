@@ -17,6 +17,7 @@ from typing import Any
 
 RE_FRAME = re.compile(r"^frame_(\d+)\.png$")
 RE_KPT2D_PER_FRAME = re.compile(r"^kpt2d_(\d+)\.npy$")
+RE_HELPER_JOINT = re.compile(r"(twist|roll|end|helper|ik|pole|weapon|prop|socket)", re.IGNORECASE)
 
 
 @dataclass
@@ -142,6 +143,30 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable full-frame overlay generation and only keep sample overlays",
     )
+    parser.add_argument(
+        "--viz-conf-threshold",
+        type=float,
+        default=0.0,
+        help="Only draw keypoints with confidence >= threshold (default: 0.0)",
+    )
+    parser.add_argument(
+        "--viz-main-joints",
+        type=str,
+        default="",
+        help="Comma-separated joint indices to visualize, e.g. '0,1,2,5,8'. Empty means visualize all",
+    )
+    parser.add_argument(
+        "--viz-auto-filter-helper-joints",
+        action="store_true",
+        default=True,
+        help="Auto-filter helper/twist/end joints in visualization using meta/joint_names.json (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-viz-auto-filter-helper-joints",
+        dest="viz_auto_filter_helper_joints",
+        action="store_false",
+        help="Disable automatic helper-joint filtering",
+    )
     return parser.parse_args()
 
 
@@ -150,6 +175,17 @@ def read_json(path: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return None
+
+
+def auto_select_main_joint_indices(joint_names: list[str]) -> set[int]:
+    selected: set[int] = set()
+    for idx, name in enumerate(joint_names):
+        if not name:
+            continue
+        if RE_HELPER_JOINT.search(name):
+            continue
+        selected.add(idx)
+    return selected
 
 
 def parse_npy_header_from_bytes(raw: bytes) -> tuple[str | None, list[int] | None, int | None]:
@@ -349,6 +385,8 @@ def save_kpt_overlay_svg(
     title: str,
     y_flip: bool = False,
     embed_image: bool = True,
+    conf_threshold: float = 0.0,
+    main_joint_indices: set[int] | None = None,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if embed_image:
@@ -366,6 +404,10 @@ def save_kpt_overlay_svg(
     ]
 
     for i, (x, y, c) in enumerate(points):
+        if c < conf_threshold:
+            continue
+        if main_joint_indices is not None and i not in main_joint_indices:
+            continue
         if y_flip:
             y = (height - 1) - y
         color = "#00ff66" if c > 0 else "#ff3b30"
@@ -402,6 +444,9 @@ def validate_action(
     overlay_per_action: int,
     overlay_all_frames: bool,
     overlay_all_root: Path,
+    viz_conf_threshold: float,
+    viz_main_joint_indices: set[int] | None,
+    viz_auto_filter_helper_joints: bool,
 ) -> ActionReport:
     action_dir = node.action_path
     report = ActionReport(action_name=node.action_name, action_path=str(action_dir), character_name=node.character_name)
@@ -455,6 +500,12 @@ def validate_action(
     expected_joints = int(report.sequence.get("joints_count")) if report.sequence and report.sequence.get("joints_count") is not None else None
     image_w = int(report.sequence.get("width", 1920)) if report.sequence else 1920
     image_h = int(report.sequence.get("height", 1080)) if report.sequence else 1080
+    joint_names_path = action_dir / "meta" / "joint_names.json"
+    joint_names_json = read_json(joint_names_path) if joint_names_path.exists() else None
+    auto_main_joint_indices: set[int] | None = None
+    if joint_names_json and isinstance(joint_names_json.get("joint_names"), list):
+        names = [str(x) for x in joint_names_json.get("joint_names")]
+        auto_main_joint_indices = auto_select_main_joint_indices(names)
 
     shared_cam_root = resolve_shared_camera_root(dataset_root, node)
     overlays_made = 0
@@ -589,7 +640,21 @@ def validate_action(
                 rel = frame_path.relative_to(dataset_root)
                 overlay_path = (overlay_all_root / rel).with_suffix(".svg")
                 title = f"{report.action_name} | {cam_id} | {frame_path.name}"
-                save_kpt_overlay_svg(overlay_path, frame_path, image_w, image_h, points, title, y_flip=False, embed_image=True)
+                draw_indices = viz_main_joint_indices
+                if draw_indices is None and auto_main_joint_indices is not None and viz_auto_filter_helper_joints:
+                    draw_indices = auto_main_joint_indices
+                save_kpt_overlay_svg(
+                    overlay_path,
+                    frame_path,
+                    image_w,
+                    image_h,
+                    points,
+                    title,
+                    y_flip=False,
+                    embed_image=True,
+                    conf_threshold=viz_conf_threshold,
+                    main_joint_indices=draw_indices,
+                )
                 cam.overlay_all_count += 1
                 if not cam.overlay_svg:
                     cam.overlay_svg = str(overlay_path)
@@ -604,7 +669,20 @@ def validate_action(
                 safe_action = re.sub(r"[^A-Za-z0-9_.-]+", "_", report.action_name)
                 overlay_path = overlay_dir / f"overlay_{safe_action}_{cam_id}_{target_idx:06d}.svg"
                 title = f"{report.action_name} | {cam_id} | frame_{target_idx:06d}"
-                save_kpt_overlay_svg(overlay_path, frame_path, image_w, image_h, points, title, y_flip=False)
+                draw_indices = viz_main_joint_indices
+                if draw_indices is None and auto_main_joint_indices is not None and viz_auto_filter_helper_joints:
+                    draw_indices = auto_main_joint_indices
+                save_kpt_overlay_svg(
+                    overlay_path,
+                    frame_path,
+                    image_w,
+                    image_h,
+                    points,
+                    title,
+                    y_flip=False,
+                    conf_threshold=viz_conf_threshold,
+                    main_joint_indices=draw_indices,
+                )
                 cam.overlay_svg = str(overlay_path)
                 overlays_made += 1
 
@@ -816,6 +894,13 @@ def main() -> int:
     args = parse_args()
     dataset_root = args.dataset_root.resolve()
     output_dir = args.output_dir.resolve()
+    viz_main_joint_indices: set[int] | None = None
+    if args.viz_main_joints.strip():
+        try:
+            viz_main_joint_indices = {int(part.strip()) for part in args.viz_main_joints.split(",") if part.strip()}
+        except ValueError:
+            print("[check.py] ERROR: --viz-main-joints 格式非法，应为逗号分隔整数，如 0,1,2,5")
+            return 2
 
     summary = Summary(checked_at_utc=datetime.utcnow().isoformat() + "Z", dataset_root=str(dataset_root))
     nodes = discover_action_nodes(dataset_root)
@@ -839,6 +924,9 @@ def main() -> int:
                 args.overlay_per_action,
                 args.overlay_all_frames,
                 overlay_all_root,
+                args.viz_conf_threshold,
+                viz_main_joint_indices,
+                args.viz_auto_filter_helper_joints,
             )
             for n in nodes
         ]
