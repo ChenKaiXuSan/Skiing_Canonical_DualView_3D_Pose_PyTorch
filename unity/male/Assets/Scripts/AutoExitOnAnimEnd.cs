@@ -25,11 +25,11 @@ public class AutoExitOnAnimEnd : MonoBehaviour
     [Tooltip("如果动画结束条件长期不满足，但采集已全部完成，则允许直接退出")]
     public bool allowExitWhenCapturesDone = true;
 
-    [Tooltip("从启动开始的最大等待秒数，超时后可强制退出（<=0 表示禁用，默认禁用）")]
-    public float forceExitTimeoutSec = -1f;
+    [Tooltip("从启动开始的最大等待秒数，超时后可强制退出（<=0 表示禁用，默认30秒）")]
+    public float forceExitTimeoutSec = 30f;
 
-    [Tooltip("即使仍有采集未完成，也允许超时后强制退出。默认关闭，避免中途退出。")]
-    public bool forceExitEvenIfCapturesPending = false;
+    [Tooltip("即使仍有采集未完成，也允许超时后强制退出。默认开启，保证超时自动退出。")]
+    public bool forceExitEvenIfCapturesPending = true;
 
     [Header("Wait Capture")]
     [Tooltip("退出前等待场景内 OneCameraCaptureFrame 全部完成")]
@@ -52,6 +52,7 @@ public class AutoExitOnAnimEnd : MonoBehaviour
     int lastLoggedParticipating = -1;
     int lastLoggedTotal = -1;
     int lastLoggedPending = -1;
+    bool hasParticipatingCaptures;
 
     void Start()
     {
@@ -69,13 +70,20 @@ public class AutoExitOnAnimEnd : MonoBehaviour
             targetHash = Animator.StringToHash(stateName);
 
         RefreshCaptureFrames();
+        hasParticipatingCaptures = CountParticipatingCaptures() > 0;
+
+        if (!hasParticipatingCaptures && !useAnimationFinishedCondition)
+        {
+            useAnimationFinishedCondition = true;
+            Debug.LogWarning("[AutoExitOnAnimEnd] No participating OneCameraCaptureFrame found. Auto-enable useAnimationFinishedCondition.");
+        }
     }
 
     void Update()
     {
         if (finished) return;
 
-        if (allowExitWhenCapturesDone && waitAllCapturesDone && IsCaptureCompletionSatisfied(requireAtLeastOneCapture: true))
+        if (hasParticipatingCaptures && allowExitWhenCapturesDone && waitAllCapturesDone && IsCaptureCompletionSatisfied(requireAtLeastOneCapture: true))
         {
             MarkFinished("captures_done");
             return;
@@ -198,6 +206,7 @@ public class AutoExitOnAnimEnd : MonoBehaviour
             var cap = captureFrames[i];
             if (cap == null) continue;
             if (!cap.autoRunOnPlay) continue;
+            if (!cap.isActiveAndEnabled) continue;
 
             participating++;
 
@@ -218,6 +227,23 @@ public class AutoExitOnAnimEnd : MonoBehaviour
             return !requireAtLeastOneCapture;
 
         return true;
+    }
+
+    int CountParticipatingCaptures()
+    {
+        if (captureFrames == null || captureFrames.Length == 0)
+            return 0;
+
+        int participating = 0;
+        for (int i = 0; i < captureFrames.Length; i++)
+        {
+            var cap = captureFrames[i];
+            if (cap == null) continue;
+            if (!cap.autoRunOnPlay) continue;
+            if (!cap.isActiveAndEnabled) continue;
+            participating++;
+        }
+        return participating;
     }
 
     void TryLogCaptureParticipation(int participating, int total, int pending, string firstPendingName = null)

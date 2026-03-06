@@ -166,9 +166,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
         public string vizFolder;
         public string kpt2dFolder;
         public string kpt2dPath;
-        public string kpt3dPath;
         public List<float> kpt2dBuffer;
-        public List<float> kpt3dBuffer;
         public int totalFrames;
         public int sampledFrames;
     }
@@ -198,9 +196,6 @@ public class OneCameraCaptureFrame : MonoBehaviour
 
     [Tooltip("可视化图片文件名前缀（仅用于可视化输出目录）")]
     public string vizImagePrefix = "viz";
-
-    [Tooltip("写出全相机共享的3D关键点（kpt3d/kpt3d.npy），若已存在则默认跳过")]
-    public bool exportSharedKpt3d = true;
 
     [Tooltip("相机内外参只保存一次到 SkiDataset/cameras/<cameraId>/")]
     public bool saveCameraMetaOnlyOnce = true;
@@ -256,9 +251,6 @@ public class OneCameraCaptureFrame : MonoBehaviour
     public int presetTargetDisplay = 0; // 建议 0
     public int presetDepth = -1;
 
-    [Tooltip("当 kpt3d.npy 已存在时是否覆盖")]
-    public bool overwriteExistingKpt3d = false;
-
     [Tooltip("是否在数据集根目录生成/刷新 dataset_manifest.json")]
     public bool exportDatasetManifest = true;
 
@@ -276,9 +268,6 @@ public class OneCameraCaptureFrame : MonoBehaviour
     [Tooltip("同时导出 2D 关键点 npz（与 npy 并存）")]
     public bool exportKpt2dNpz = true;
 
-    [Tooltip("同时导出 3D 关键点 npz（与 npy 并存）")]
-    public bool exportKpt3dNpz = false;
-
     // 新增：每帧单独导出 kpt2d npy
     [Tooltip("每帧单独导出 2D 关键点 npy 到 kpt2d 文件夹")]
     public bool exportKpt2dPerFrame = true;
@@ -290,12 +279,21 @@ public class OneCameraCaptureFrame : MonoBehaviour
     [Tooltip("可视化关键点半径（像素）")]
     public int vizPointRadius = 3;
 
+    [Header("Log Export")]
+    [Tooltip("将采样/保存过程日志同时写入文件")]
+    public bool saveOutputLogToFile = true;
+
+    [Tooltip("日志文件名前缀")]
+    public string outputLogFilePrefix = "capture_log";
+
     // session
     private float baseTime;
 
     // resources
     private RenderTexture rt;
     private Texture2D tex;
+    private StreamWriter captureLogWriter;
+    private string captureLogPath;
 
     public bool IsCaptureDone { get; private set; } = false;
     public bool IsCaptureStarted { get; private set; } = false;
@@ -411,6 +409,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
         }
         finally
         {
+            CloseCaptureLog();
             if (syncRegistered)
                 GlobalFrameSync.Unregister();
         }
@@ -420,11 +419,13 @@ public class OneCameraCaptureFrame : MonoBehaviour
     {
         string root = Path.Combine(Application.dataPath, "..", "..", outRootFolder);
         string characterRoot = Path.Combine(root, characterFolder);
+        InitCaptureLog(characterRoot);
         string safeCameraIdForKpt2d = string.IsNullOrWhiteSpace(cameraId) ? "cam_unknown" : cameraId;
         string captureFolderName = string.IsNullOrWhiteSpace(captureFolderPrefix)
             ? cameraId
             : $"{captureFolderPrefix}_{cameraId}";
         string kpt2dFileName = string.IsNullOrWhiteSpace(kptPrefix) ? "kpt2d.npy" : $"{kptPrefix}.npy";
+        LogInfo($"[OneCameraCaptureFrame] Capture started. character={characterFolder}, camera={cameraId}, root={characterRoot}");
 
         if (saveCameraMetaOnlyOnce)
         {
@@ -484,15 +485,12 @@ public class OneCameraCaptureFrame : MonoBehaviour
             string imageFolder = Path.Combine(actionRoot, "frames", captureFolderName);
             string vizFolder = Path.Combine(actionRoot, "viz", captureFolderName);
             string kpt2dFolder = Path.Combine(actionRoot, "kpt2d", safeCameraIdForKpt2d);
-            string kpt3dFolder = Path.Combine(actionRoot, "kpt3d");
             string kpt2dPath = Path.Combine(kpt2dFolder, kpt2dFileName);
-            string kpt3dPath = Path.Combine(kpt3dFolder, "kpt3d.npy");
 
             Directory.CreateDirectory(metaFolder);
             Directory.CreateDirectory(imageFolder);
             if (exportKpt2dOverlayImage) Directory.CreateDirectory(vizFolder);
             Directory.CreateDirectory(kpt2dFolder);
-            Directory.CreateDirectory(kpt3dFolder);
 
             if (!saveCameraMetaOnlyOnce)
             {
@@ -511,9 +509,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
                 vizFolder = vizFolder,
                 kpt2dFolder = kpt2dFolder,
                 kpt2dPath = kpt2dPath,
-                kpt3dPath = kpt3dPath,
                 kpt2dBuffer = new List<float>(expectedSamples * joints.Length * 3),
-                kpt3dBuffer = new List<float>(expectedSamples * joints.Length * 3),
                 totalFrames = actionTotalFrames.TryGetValue(safeActionName, out var tf) ? tf : 0,
                 sampledFrames = 0,
             };
@@ -523,7 +519,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
                 WriteJointNamesMeta(Path.Combine(metaFolder, "joint_names.json"));
             actionStates.Add(safeActionName, state);
 
-            Debug.Log($"[OneCameraCaptureFrame] Output camera folder: {imageFolder}");
+            LogInfo($"[OneCameraCaptureFrame] Output camera folder: {imageFolder}");
             return state;
         }
 
@@ -558,8 +554,6 @@ public class OneCameraCaptureFrame : MonoBehaviour
             ));
 
             state.sampledFrames++;
-            if (exportSharedKpt3d)
-                AppendKpt3DWorldTJC3(state.kpt3dBuffer);
 
             outputFrameIdx++;
 
@@ -599,8 +593,6 @@ public class OneCameraCaptureFrame : MonoBehaviour
             ));
 
             state.sampledFrames++;
-            if (exportSharedKpt3d)
-                AppendKpt3DWorldTJC3(state.kpt3dBuffer);
 
             outputFrameIdx++;
 
@@ -615,8 +607,6 @@ public class OneCameraCaptureFrame : MonoBehaviour
         {
             var state = kv.Value;
             WriteKpt2DNpy(state.kpt2dPath, state.kpt2dBuffer, state.sampledFrames, joints.Length);
-            if (exportSharedKpt3d && state.kpt3dBuffer.Count > 0)
-                WriteKpt3DNpy(state.kpt3dPath, state.kpt3dBuffer, state.sampledFrames, joints.Length);
 
             WriteSequenceMeta(Path.Combine(state.metaFolder, "sequence.json"), state.actionName, state.totalFrames, state.sampledFrames, stride);
         }
@@ -624,7 +614,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
         if (exportDatasetManifest)
             WriteDatasetManifest(characterRoot, characterFolder);
 
-        Debug.Log($"[OneCameraCaptureFrame] Capture summary | totalFrames={totalFrames}, stride={stride}, savedFrames={outputFrameIdx}, actions={actionStates.Count}");
+        LogInfo($"[OneCameraCaptureFrame] Capture summary | totalFrames={totalFrames}, stride={stride}, savedFrames={outputFrameIdx}, actions={actionStates.Count}");
 
 
         if (targetAnimator)
@@ -637,7 +627,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
         Destroy(rt);
         Destroy(tex);
 
-        Debug.Log("[OneCameraCaptureFrame] Done.");
+        LogInfo("[OneCameraCaptureFrame] Done.");
     }
 
     IEnumerator WaitForGlobalSyncReady()
@@ -647,7 +637,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
         {
             if (globalSyncWaitTimeoutSec > 0f && Time.realtimeSinceStartup - begin > globalSyncWaitTimeoutSec)
             {
-                Debug.LogWarning($"[OneCameraCaptureFrame] Global sync ready timeout. registered={GlobalFrameSync.registeredParticipants}, expected={GlobalFrameSync.expectedParticipants}");
+                LogWarning($"[OneCameraCaptureFrame] Global sync ready timeout. registered={GlobalFrameSync.registeredParticipants}, expected={GlobalFrameSync.expectedParticipants}");
                 yield break;
             }
             yield return null;
@@ -681,7 +671,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
         targetAnimator.enabled = false;
         seg.clip.SampleAnimation(targetAnimator.gameObject, tSec);
 
-        Debug.Log($"采样帧: {sampleIdx}/{Mathf.Max(0, totalFrames - 1)} | 动作: {seg.clip.name} | 局部帧: {localFrame}/{Mathf.Max(0, seg.frameCount - 1)} | 时间: {tSec:F3}s/{seg.clip.length:F3}s");
+        LogInfo($"采样帧: {sampleIdx}/{Mathf.Max(0, totalFrames - 1)} | 动作: {seg.clip.name} | 局部帧: {localFrame}/{Mathf.Max(0, seg.frameCount - 1)} | 时间: {tSec:F3}s/{seg.clip.length:F3}s");
     }
 
     ClipSegment GetSegmentAtFrame(List<ClipSegment> clipSegments, int sampleIdx, int totalFrames, out int localFrame)
@@ -760,7 +750,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
     {
         if (segments == null || segments.Count == 0)
         {
-            Debug.LogWarning($"[OneCameraCaptureFrame] {tag}: no clip segments");
+            LogWarning($"[OneCameraCaptureFrame] {tag}: no clip segments");
             return;
         }
 
@@ -769,11 +759,11 @@ public class OneCameraCaptureFrame : MonoBehaviour
         {
             var s = segments[i];
             totalSec += s.clip.length;
-            Debug.Log($"[OneCameraCaptureFrame] {tag} clip[{i}] = {s.clip.name}, length={s.clip.length:F3}s, fps={s.clip.frameRate:F2}, frames={s.frameCount}");
+            LogInfo($"[OneCameraCaptureFrame] {tag} clip[{i}] = {s.clip.name}, length={s.clip.length:F3}s, fps={s.clip.frameRate:F2}, frames={s.frameCount}");
         }
 
         int totalFrames = GetTotalFramesFromSegments(segments);
-        Debug.Log($"<color=yellow>[OneCameraCaptureFrame] {tag} summary: clips={segments.Count}, totalLength={totalSec:F3}s, totalFrames={totalFrames}</color>");
+        LogInfo($"<color=yellow>[OneCameraCaptureFrame] {tag} summary: clips={segments.Count}, totalLength={totalSec:F3}s, totalFrames={totalFrames}</color>");
     }
 
     IEnumerator CaptureSingleFrame(
@@ -794,13 +784,13 @@ public class OneCameraCaptureFrame : MonoBehaviour
 
         if (captureWidth <= 0 || captureHeight <= 0)
         {
-            Debug.LogError($"[OneCameraCaptureFrame] Invalid capture size: {captureWidth}x{captureHeight}");
+            LogError($"[OneCameraCaptureFrame] Invalid capture size: {captureWidth}x{captureHeight}");
             yield break;
         }
 
         if (rt == null || !rt.IsCreated())
         {
-            Debug.LogError("[OneCameraCaptureFrame] RenderTexture is null or not created.");
+            LogError("[OneCameraCaptureFrame] RenderTexture is null or not created.");
             yield break;
         }
 
@@ -821,7 +811,7 @@ public class OneCameraCaptureFrame : MonoBehaviour
         }
         catch (Exception ex)
         {
-            Debug.LogError($"[OneCameraCaptureFrame] Failed to save PNG: {imgPath}\n{ex}");
+            LogError($"[OneCameraCaptureFrame] Failed to save PNG: {imgPath}\n{ex}");
         }
         finally
         {
@@ -829,9 +819,9 @@ public class OneCameraCaptureFrame : MonoBehaviour
         }
 
         if (!File.Exists(imgPath))
-            Debug.LogError($"[OneCameraCaptureFrame] PNG write failed: {imgPath}");
+            LogError($"[OneCameraCaptureFrame] PNG write failed: {imgPath}");
         else if (outputFrameIdx == 0)
-            Debug.Log($"[OneCameraCaptureFrame] First frame saved: {imgPath}");
+            LogInfo($"[OneCameraCaptureFrame] First frame saved: {imgPath}");
 
         FillRecord(rec, frameIdx);
 
@@ -906,11 +896,88 @@ public class OneCameraCaptureFrame : MonoBehaviour
         }
         catch (Exception ex)
         {
-            Debug.LogError($"[OneCameraCaptureFrame] Failed to save viz PNG: {path}\n{ex}");
+            LogError($"[OneCameraCaptureFrame] Failed to save viz PNG: {path}\n{ex}");
         }
         finally
         {
             Destroy(vizTex);
+        }
+    }
+
+    void InitCaptureLog(string characterRoot)
+    {
+        if (!saveOutputLogToFile) return;
+
+        try
+        {
+            string logsFolder = Path.Combine(characterRoot, "logs");
+            Directory.CreateDirectory(logsFolder);
+
+            string safeCam = MakeSafePathName(string.IsNullOrWhiteSpace(cameraId) ? "cam_unknown" : cameraId);
+            string safePrefix = string.IsNullOrWhiteSpace(outputLogFilePrefix) ? "capture_log" : MakeSafePathName(outputLogFilePrefix);
+            string ts = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+            captureLogPath = Path.Combine(logsFolder, $"{safePrefix}_{safeCam}_{ts}.log");
+
+            captureLogWriter = new StreamWriter(captureLogPath, false, Encoding.UTF8);
+            captureLogWriter.AutoFlush = true;
+            captureLogWriter.WriteLine($"[{DateTime.UtcNow:O}] [INFO] [OneCameraCaptureFrame] Log file created: {captureLogPath}");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[OneCameraCaptureFrame] Failed to initialize output log file. {ex.Message}");
+            captureLogWriter = null;
+            captureLogPath = null;
+        }
+    }
+
+    void CloseCaptureLog()
+    {
+        if (captureLogWriter == null) return;
+
+        try
+        {
+            captureLogWriter.WriteLine($"[{DateTime.UtcNow:O}] [INFO] [OneCameraCaptureFrame] Log file closed.");
+            captureLogWriter.Flush();
+            captureLogWriter.Dispose();
+        }
+        catch
+        {
+        }
+        finally
+        {
+            captureLogWriter = null;
+            captureLogPath = null;
+        }
+    }
+
+    void LogInfo(string msg)
+    {
+        Debug.Log(msg);
+        WriteLogFileLine("INFO", msg);
+    }
+
+    void LogWarning(string msg)
+    {
+        Debug.LogWarning(msg);
+        WriteLogFileLine("WARN", msg);
+    }
+
+    void LogError(string msg)
+    {
+        Debug.LogError(msg);
+        WriteLogFileLine("ERROR", msg);
+    }
+
+    void WriteLogFileLine(string level, string msg)
+    {
+        if (!saveOutputLogToFile || captureLogWriter == null) return;
+
+        try
+        {
+            captureLogWriter.WriteLine($"[{DateTime.UtcNow:O}] [{level}] {msg}");
+        }
+        catch
+        {
         }
     }
 
@@ -1063,47 +1130,6 @@ public class OneCameraCaptureFrame : MonoBehaviour
             bw.Write((byte)0);
 
             string dict = $"{{'descr': '<f4', 'fortran_order': False, 'shape': ({t}, {j}, 3), }}";
-            int preambleLen = 10;
-            int padLen = 16 - ((preambleLen + dict.Length + 1) % 16);
-            if (padLen == 16) padLen = 0;
-            string header = dict + new string(' ', padLen) + "\n";
-
-            byte[] headerBytes = Encoding.ASCII.GetBytes(header);
-            bw.Write((ushort)headerBytes.Length);
-            bw.Write(headerBytes);
-
-            for (int i = 0; i < data.Count; i++)
-                bw.Write(data[i]);
-        }
-    }
-
-    void AppendKpt3DWorldTJC3(List<float> outBuffer)
-    {
-        for (int i = 0; i < joints.Length; i++)
-        {
-            Vector3 p = joints[i].position;
-            outBuffer.Add(p.x);
-            outBuffer.Add(p.y);
-            outBuffer.Add(p.z);
-        }
-    }
-
-    void WriteKpt3DNpy(string path, List<float> data, int t, int j)
-    {
-        WriteFloatNpy(path, data, t, j, 3);
-    }
-
-    void WriteFloatNpy(string path, List<float> data, int d0, int d1, int d2)
-    {
-        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
-        using (var bw = new BinaryWriter(fs))
-        {
-            bw.Write((byte)0x93);
-            bw.Write(Encoding.ASCII.GetBytes("NUMPY"));
-            bw.Write((byte)1);
-            bw.Write((byte)0);
-
-            string dict = $"{{'descr': '<f4', 'fortran_order': False, 'shape': ({d0}, {d1}, {d2}), }}";
             int preambleLen = 10;
             int padLen = 16 - ((preambleLen + dict.Length + 1) % 16);
             if (padLen == 16) padLen = 0;
