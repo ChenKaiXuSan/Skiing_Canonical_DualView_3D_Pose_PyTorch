@@ -19,6 +19,7 @@ from typing import Any
 
 RE_FRAME = re.compile(r"^frame_(\d+)\.png$")
 RE_KPT2D_PER_FRAME = re.compile(r"^kpt2d_(\d+)\.npy$")
+RE_GENERIC_PER_FRAME_NPY = re.compile(r"^(.+?)_(\d+)\.npy$")
 RE_HELPER_JOINT = re.compile(r"(twist|roll|end|helper|ik|pole|weapon|prop|socket)", re.IGNORECASE)
 
 
@@ -312,6 +313,54 @@ def extract_indices(file_paths: list[Path], regex: re.Pattern[str]) -> list[int]
         if m:
             out.append(int(m.group(1)))
     return sorted(out)
+
+
+def detect_kpt2d_files(kpt2d_dir: Path) -> tuple[Path | None, Path | None, list[Path], str | None]:
+    if not kpt2d_dir.exists():
+        return None, None, [], None
+
+    npy_files = sorted([p for p in kpt2d_dir.glob("*.npy") if p.is_file()])
+    npz_files = sorted([p for p in kpt2d_dir.glob("*.npz") if p.is_file()])
+
+    # Prefer canonical names if present.
+    main_npy = kpt2d_dir / "kpt2d.npy"
+    if not main_npy.exists():
+        main_npy = None
+
+    main_npz = kpt2d_dir / "kpt2d.npz"
+    if not main_npz.exists():
+        main_npz = None
+
+    per_frame_groups: dict[str, list[Path]] = {}
+    for p in npy_files:
+        m = RE_GENERIC_PER_FRAME_NPY.match(p.name)
+        if not m:
+            continue
+        prefix = m.group(1)
+        per_frame_groups.setdefault(prefix, []).append(p)
+
+    # If canonical names are missing, infer from files.
+    if main_npy is None:
+        non_per_frame = [p for p in npy_files if RE_GENERIC_PER_FRAME_NPY.match(p.name) is None]
+        if non_per_frame:
+            main_npy = non_per_frame[0]
+
+    if main_npz is None and npz_files:
+        main_npz = npz_files[0]
+
+    selected_prefix: str | None = None
+    if main_npy is not None:
+        selected_prefix = main_npy.stem
+
+    if selected_prefix is None and per_frame_groups:
+        # Pick the prefix with most files to avoid selecting unrelated npy groups.
+        selected_prefix = max(per_frame_groups.items(), key=lambda kv: len(kv[1]))[0]
+
+    per_frame_files: list[Path] = []
+    if selected_prefix is not None and selected_prefix in per_frame_groups:
+        per_frame_files = sorted(per_frame_groups[selected_prefix])
+
+    return main_npy, main_npz, per_frame_files, selected_prefix
 
 
 def count_gaps(indices: list[int]) -> int:
@@ -884,16 +933,31 @@ def validate_action(
         report.issues.append(Issue("ERROR", "action", "未发现任何相机目录（cameras/frames/kpt2d）"))
         return report
 
-    expected_sampled = int(report.sequence.get("sampled_frames")) if report.sequence and report.sequence.get("sampled_frames") is not None else None
-    expected_joints = int(report.sequence.get("joints_count")) if report.sequence and report.sequence.get("joints_count") is not None else None
-    image_w = int(report.sequence.get("width", 1920)) if report.sequence else 1920
-    image_h = int(report.sequence.get("height", 1080)) if report.sequence else 1080
+    expected_sampled: int | None = None
+    expected_joints: int | None = None
+    image_w = 1920
+    image_h = 1080
+    if report.sequence:
+        sampled_val = report.sequence.get("sampled_frames")
+        joints_val = report.sequence.get("joints_count")
+        width_val = report.sequence.get("width", 1920)
+        height_val = report.sequence.get("height", 1080)
+
+        if sampled_val is not None:
+            expected_sampled = int(sampled_val)
+        if joints_val is not None:
+            expected_joints = int(joints_val)
+        image_w = int(width_val)
+        image_h = int(height_val)
+
     joint_names_path = action_dir / "meta" / "joint_names.json"
     joint_names_json = read_json(joint_names_path) if joint_names_path.exists() else None
     auto_main_joint_indices: set[int] | None = None
-    if joint_names_json and isinstance(joint_names_json.get("joint_names"), list):
-        names = [str(x) for x in joint_names_json.get("joint_names")]
-        auto_main_joint_indices = auto_select_main_joint_indices(names)
+    if joint_names_json:
+        joint_names_val = joint_names_json.get("joint_names")
+        if isinstance(joint_names_val, list):
+            names = [str(x) for x in joint_names_val]
+            auto_main_joint_indices = auto_select_main_joint_indices(names)
 
     shared_cam_root = resolve_shared_camera_root(dataset_root, node)
     overlays_made = 0
@@ -934,28 +998,26 @@ def validate_action(
             cam.issues.append(Issue("ERROR", f"camera:{cam_id}", "未找到 frame_*.png"))
 
         kpt2d_dir = kpt2d_root / cam_id
-        kpt2d_main = kpt2d_dir / "kpt2d.npy"
-        kpt2d_npz = kpt2d_dir / "kpt2d.npz"
-        per_frame_files = sorted(kpt2d_dir.glob("kpt2d_*.npy")) if kpt2d_dir.exists() else []
+        kpt2d_main, kpt2d_npz, per_frame_files, kpt2d_prefix = detect_kpt2d_files(kpt2d_dir)
 
-        cam.has_kpt2d_npy = kpt2d_main.exists()
-        if cam.has_kpt2d_npy:
+        cam.has_kpt2d_npy = kpt2d_main is not None and kpt2d_main.exists()
+        if cam.has_kpt2d_npy and kpt2d_main is not None:
             cam.kpt2d_shape = parse_npy_shape(kpt2d_main)
             if cam.kpt2d_shape is None:
-                cam.issues.append(Issue("ERROR", f"camera:{cam_id}", "kpt2d.npy shape 读取失败"))
+                cam.issues.append(Issue("ERROR", f"camera:{cam_id}", f"{kpt2d_main.name} shape 读取失败"))
         else:
             if per_frame_files:
-                cam.issues.append(Issue("WARN", f"camera:{cam_id}", "缺少 kpt2d.npy（但存在 kpt2d_*.npy）"))
+                cam.issues.append(Issue("WARN", f"camera:{cam_id}", "缺少主 kpt npy（但存在 *_NNNNNN.npy）"))
             else:
-                cam.issues.append(Issue("ERROR", f"camera:{cam_id}", "缺少 kpt2d.npy 与 kpt2d_*.npy"))
+                cam.issues.append(Issue("ERROR", f"camera:{cam_id}", "缺少 kpt2d 主文件与逐帧文件"))
 
-        cam.has_kpt2d_npz = kpt2d_npz.exists()
+        cam.has_kpt2d_npz = kpt2d_npz is not None and kpt2d_npz.exists()
         npz_kpt_shape: list[int] | None = None
         npz_kpt_data: list[float] | None = None
-        if cam.has_kpt2d_npz:
+        if cam.has_kpt2d_npz and kpt2d_npz is not None:
             cam.kpt2d_npz_arrays = parse_npz_shapes(kpt2d_npz)
             if not cam.kpt2d_npz_arrays:
-                cam.issues.append(Issue("ERROR", f"camera:{cam_id}", "kpt2d.npz 存在但无法解析"))
+                cam.issues.append(Issue("ERROR", f"camera:{cam_id}", f"{kpt2d_npz.name} 存在但无法解析"))
             else:
                 npz_float_arrays = parse_npz_float32_arrays(kpt2d_npz)
                 preferred_names = ["kpt2d.npy", "kpt2d", "arr_0.npy", "arr_0"]
@@ -967,6 +1029,13 @@ def validate_action(
                         break
 
         per_idx = extract_indices(per_frame_files, RE_KPT2D_PER_FRAME)
+        if not per_idx:
+            per_idx = sorted(
+                int(m.group(2))
+                for p in per_frame_files
+                for m in [RE_GENERIC_PER_FRAME_NPY.match(p.name)]
+                if m is not None
+            )
         cam.kpt2d_per_frame_count = len(per_frame_files)
         cam.kpt2d_per_frame_gaps = count_gaps(per_idx)
         if per_frame_files and cam.kpt2d_per_frame_gaps > 0:
@@ -994,7 +1063,7 @@ def validate_action(
 
         main_kpt_shape: list[int] | None = None
         main_kpt_data: list[float] | None = None
-        if kpt2d_main.exists():
+        if kpt2d_main is not None and kpt2d_main.exists():
             main_kpt_shape, main_kpt_data = parse_npy_float32_data(kpt2d_main)
 
         def get_points_for_frame(frame_index: int) -> list[tuple[float, float, float]]:
@@ -1002,8 +1071,17 @@ def validate_action(
                 cam.overlay_point_source = "npz"
                 return reshape_kpt2d_points(npz_kpt_shape, npz_kpt_data, frame_index)
 
-            per_frame_kpt = kpt2d_dir / f"kpt2d_{frame_index:06d}.npy"
-            if per_frame_kpt.exists():
+            per_frame_kpt = None
+            if kpt2d_prefix:
+                cand = kpt2d_dir / f"{kpt2d_prefix}_{frame_index:06d}.npy"
+                if cand.exists():
+                    per_frame_kpt = cand
+            if per_frame_kpt is None:
+                cand = kpt2d_dir / f"kpt2d_{frame_index:06d}.npy"
+                if cand.exists():
+                    per_frame_kpt = cand
+
+            if per_frame_kpt is not None and per_frame_kpt.exists():
                 shp, data = parse_npy_float32_data(per_frame_kpt)
                 if shp and data is not None:
                     cam.overlay_point_source = "npy-per-frame"
@@ -1186,16 +1264,11 @@ def generate_visuals(report: FullReport, output_dir: Path) -> list[str]:
         if cams:
             labels = [c.camera_id for c in cams]
             frame_vals = [float(c.frame_count) for c in cams]
-            per_vals = [float(c.kpt2d_per_frame_count) for c in cams]
             safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", action.action_name)
 
             p1 = fig_dir / f"{safe_name}_frames_per_camera.svg"
             save_svg_bar_chart(p1, f"{action.action_name} - Frames per Camera", labels, frame_vals, "#frames")
             generated.append(str(p1))
-
-            p2 = fig_dir / f"{safe_name}_kpt2d_per_frame_per_camera.svg"
-            save_svg_bar_chart(p2, f"{action.action_name} - kpt2d per-frame count", labels, per_vals, "#kpt2d files")
-            generated.append(str(p2))
 
         for cam in cams:
             if cam.overlay_svg:
