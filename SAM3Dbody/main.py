@@ -54,10 +54,12 @@ def process_single_action(
     action_log_file = log_dir / f"{action_id}.log"
 
     handler = logging.FileHandler(action_log_file, mode="a", encoding="utf-8")
+    handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
     action_logger = logging.getLogger(f"action_{action_id}")
     action_logger.handlers.clear()
+    action_logger.setLevel(logging.INFO)
     action_logger.addHandler(handler)
     action_logger.propagate = False
 
@@ -242,6 +244,22 @@ def main(cfg: DictConfig) -> None:
             shard_count,
         )
         return
+
+    # Persist shard assignment for post-run overlap checks across nodes.
+    shard_log_dir = action_log_root / "shard_actions"
+    shard_log_dir.mkdir(parents=True, exist_ok=True)
+    shard_log_file = shard_log_dir / f"shard_{shard_index:03d}_of_{shard_count:03d}.txt"
+    with shard_log_file.open("w", encoding="utf-8") as f:
+        f.write(f"shard_index={shard_index}\n")
+        f.write(f"shard_count={shard_count}\n")
+        f.write(f"total_actions_all={len(action_dirs_all)}\n")
+        f.write(f"actions_in_shard={len(action_dirs)}\n")
+        f.write("actions:\n")
+        for action_dir in action_dirs:
+            rel_action = action_dir.relative_to(source_root)
+            f.write(f"{rel_action.as_posix()}\n")
+
+    logger.info("Shard action list saved: %s", shard_log_file)
 
     chunks = split_evenly(action_dirs, total_workers)
 

@@ -2,8 +2,8 @@
 #PBS -A SSR
 #PBS -q gpu
 #PBS -l elapstim_req=24:00:00
-#PBS -N sam3d_8nodes_run
-#PBS -t 0-7                           # 8 nodes (modify with TOTAL_NODES below)
+#PBS -N sam3d_24nodes_run
+#PBS -t 0-23                          # 24 nodes (modify with TOTAL_NODES below)
 #PBS -o logs/pegasus/sam3d_group_${PBS_SUBREQNO}.log
 #PBS -e logs/pegasus/sam3d_group_${PBS_SUBREQNO}_err.log
 
@@ -22,7 +22,7 @@ conda env list
 
 # === 2. 多node任务划分 ===
 # Keep this value consistent with #PBS -t range: 0-(TOTAL_NODES-1)
-TOTAL_NODES=8
+TOTAL_NODES=24
 THREADS_PER_NODE=6
 
 NODE_INDEX=${PBS_SUBREQNO:-0}
@@ -38,9 +38,9 @@ echo "Threads Per Node: $THREADS_PER_NODE"
 echo "Action Shard: ${NODE_INDEX}/${TOTAL_NODES}"
 
 # === 3. パス設定と実行 ===
-UNITY_DATASET_PATH="/work/SSR/share/data/skiing_unity_dataset/data"
-RESULT_ROOT_PATH="/work/SSR/share/data/skiing_unity_dataset/sam3d_body_results"
-CKPT_ROOT="${PROJECT_ROOT}/ckpt/sam-3d-body-dinov3"
+UNITY_DATASET_PATH="/work/SSR/share/data/skiing/skiing_unity_dataset/data"
+RESULT_ROOT_PATH="/work/SSR/share/data/skiing/skiing_unity_dataset/sam3d_body_results"
+CKPT_ROOT="/work/SSR/share/ckpt/sam-3d-body-dinov3"
 
 echo "🏁 Node ${PBS_SUBREQNO} started at: $(date)"
 echo "Unity Dataset Path: $UNITY_DATASET_PATH"
