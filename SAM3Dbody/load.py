@@ -70,3 +70,40 @@ def load_data(input_video_path: Dict[str, Path]) -> Dict[str, List[np.ndarray]]:
             f"動画の読み込み完了。合計 {len(view_frames_list[view])} フレームを抽出しました。"
         )
     return view_frames_list
+
+
+def load_capture_frames(capture_dir: Path) -> List[np.ndarray]:
+    """Load one capture folder into an RGB frame list."""
+    frame_files = sorted(
+        [
+            p
+            for p in capture_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}
+        ]
+    )
+
+    frames: List[np.ndarray] = []
+    for frame_file in frame_files:
+        frame_bgr = cv2.imread(str(frame_file), cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            logger.warning("[Skip] Failed to read image: %s", frame_file)
+            continue
+        frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+
+    return frames
+
+
+def collect_action_dirs(source_root: Path) -> List[Path]:
+    """Collect all action directories that contain a ``frames`` subdirectory.
+
+    This keeps worker partitioning at action granularity regardless of the
+    dataset hierarchy (e.g., gender/action or person/action).
+    """
+    action_dirs = sorted(
+        [
+            p.parent
+            for p in source_root.rglob("frames")
+            if p.is_dir() and p.parent.is_dir()
+        ]
+    )
+    return action_dirs

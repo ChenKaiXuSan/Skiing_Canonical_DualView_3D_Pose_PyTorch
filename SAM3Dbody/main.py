@@ -1,269 +1,294 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
-"""
-File: /workspace/code/SAM3Dbody/main_multi_gpu_process.py
-Project: /workspace/code/SAM3Dbody
-Created Date: Monday January 26th 2026
-Author: Kaixu Chen
------
-Comment:
-根据多GPU并行处理SAM-3D-Body推理任务。
-
-Have a good code time :)
------
-Last Modified: Monday January 26th 2026 5:12:10 pm
-Modified By: the developer formerly known as Kaixu Chen at <chenkaixusan@gmail.com>
------
-Copyright (c) 2026 The University of Tsukuba
------
-HISTORY:
-Date      	By	Comments
-----------	---	---------------------------------------------------------
-"""
+"""Run SAM-3D-Body inference on unity image frames by action in parallel."""
 
 import logging
-import os
 import multiprocessing as mp
+import os
+from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List
-import numpy as np
+from typing import List, Union
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-# 假设这些是从你的其他模块导入的
 from .infer import process_frame_list
-from .load import load_data
-
-# --- 常量定义 ---
-REQUIRED_VIEWS = {"front", "left", "right"}
+from .load import collect_action_dirs, load_capture_frames
 
 logger = logging.getLogger(__name__)
 
+def split_evenly(items: List[Path], num_chunks: int) -> List[List[Path]]:
+    """Split a list into near-even contiguous chunks."""
+    if num_chunks <= 0:
+        return []
 
-# ---------------------------------------------------------------------
-# 核心处理逻辑：处理单个人的数据
-# ---------------------------------------------------------------------
-def process_single_person(
-    person_dir: Path,
+    n = len(items)
+    base = n // num_chunks
+    extra = n % num_chunks
+
+    chunks: List[List[Path]] = []
+    start = 0
+    for i in range(num_chunks):
+        size = base + (1 if i < extra else 0)
+        end = start + size
+        chunks.append(items[start:end])
+        start = end
+    return chunks
+
+
+def process_single_action(
+    action_dir: Path,
     source_root: Path,
-    out_root: Path,
+    vis_root: Path,
     infer_root: Path,
     cfg: DictConfig,
-):
-    """处理单个人员的所有环境和视角"""
-    person_id = person_dir.name
-    vid_patterns = ["*.mp4", "*.mov", "*.avi", "*.mkv", "*.MP4", "*.MOV"]
+) -> None:
+    """Process all captures in one action directory."""
+    rel_action = action_dir.relative_to(source_root)
+    action_id = str(rel_action).replace("/", "__")
 
-    # --- 1. Person専用のログ設定 ---
-    log_dir = out_root / "person_logs"
+    log_dir = infer_root.parent / "logs" / "action_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    person_log_file = log_dir / f"{person_id}.log"
+    action_log_file = log_dir / f"{action_id}.log"
 
-    # 新しいハンドラを作成
-    handler = logging.FileHandler(person_log_file, mode="a", encoding="utf-8")
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
+    handler = logging.FileHandler(action_log_file, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
-    logger = logging.getLogger(person_id)  # このPerson専用のロガーを取得
-    logger.addHandler(handler)
-    logger.propagate = False  # 親（Root）ロガーにログを流さない（混ざるのを防ぐ）
+    action_logger = logging.getLogger(f"action_{action_id}")
+    action_logger.handlers.clear()
+    action_logger.addHandler(handler)
+    action_logger.propagate = False
 
-    logger.info(f"==== Starting Process for Person: {person_id} ====")
+    action_logger.info("==== Start Action: %s ====", rel_action)
 
-    env_dirs = sorted([x for x in person_dir.iterdir() if x.is_dir()])
-    if not env_dirs:
-        logger.warning(f"跳过：{person_dir} 下没有环境目录")
+    frames_dir = action_dir / "frames"
+    capture_dirs = sorted([x for x in frames_dir.iterdir() if x.is_dir()])
+    if not capture_dirs:
+        action_logger.warning("[Skip] No capture dirs in: %s", frames_dir)
         return
 
-    for env_dir in env_dirs:
-        env_name = env_dir.name
-        rel_env = env_dir.relative_to(source_root)
-
-        # --- 视频处理逻辑 ---
-        view_map: Dict[str, Path] = {}
-        for pat in vid_patterns:
-            for f in env_dir.glob(pat):
-                stem = f.stem.lower()
-                if stem in REQUIRED_VIEWS:
-                    view_map[stem] = f.resolve()
-
-        if not all(v in view_map for v in REQUIRED_VIEWS):
-            logger.warning(f"[Skip] {rel_env}: 视角不全 {list(view_map.keys())}")
+    for capture_dir in capture_dirs:
+        rel_capture = capture_dir.relative_to(source_root)
+        frame_list = load_capture_frames(capture_dir)
+        if not frame_list:
+            action_logger.warning("[Skip] Empty capture: %s", rel_capture)
             continue
 
-        view_frames: Dict[str, List[np.ndarray]] = load_data(view_map)
+        action_logger.info(
+            "Processing %s, frame_count=%d",
+            rel_capture,
+            len(frame_list),
+        )
 
-        for view, frames in view_frames.items():
-            logger.info(f"  视角 {view} 处理了 {len(frames)} 帧数据。")
-            _out_root = out_root / rel_env / view
-            _out_root.mkdir(parents=True, exist_ok=True)
-            _infer_root = infer_root / rel_env / view
-            _infer_root.mkdir(parents=True, exist_ok=True)
+        out_dir = vis_root / rel_capture
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-            process_frame_list(
-                frame_list=frames,
-                out_dir=_out_root,
-                inference_output_path=_infer_root,
-                cfg=cfg,
-            )
+        infer_dir = infer_root / rel_capture
+        infer_dir.mkdir(parents=True, exist_ok=True)
+
+        process_frame_list(
+            frame_list=frame_list,
+            out_dir=out_dir,
+            inference_output_path=infer_dir,
+            cfg=cfg,
+        )
+
+    action_logger.info("==== Finished Action: %s ====", rel_action)
 
 
-# ---------------------------------------------------------------------
-# GPU Worker：进程执行函数
-# ---------------------------------------------------------------------
 def gpu_worker(
-    gpu_id: int,
-    person_dirs: List[Path],
+    gpu_id: Union[int, str],
+    action_dirs: List[Path],
     source_root: Path,
-    out_root: Path,
+    vis_root: Path,
     infer_root: Path,
     cfg_dict: dict,
-):
-    """
-    每个进程的入口：设置环境变量，并处理分配的任务列表
-    """
-    # 1. 隔离 GPU
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    worker_id: int,
+) -> None:
+    """Worker entrypoint: pin device and process assigned actions."""
+    is_cpu = isinstance(gpu_id, str) and gpu_id.lower() == "cpu"
+    if is_cpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    cfg_dict["infer"]["gpu"] = 0  # 因为上面已经隔离了 GPU，所以这里设为 0
+    local_cfg_dict = deepcopy(cfg_dict)
+    local_cfg_dict.setdefault("infer", {})
+    local_cfg_dict["infer"]["gpu"] = "cpu" if is_cpu else 0
+    cfg = OmegaConf.create(local_cfg_dict)
 
-    # 2. 将字典转回 Hydra 配置（多进程传递对象时，转为字典更安全）
-    cfg = OmegaConf.create(cfg_dict)
+    logger.info(
+        "[Worker %d] GPU %s started, actions=%d",
+        worker_id,
+        gpu_id,
+        len(action_dirs),
+    )
 
-    logger.info(f"🟢 GPU {gpu_id} 进程启动，待处理人数: {len(person_dirs)}")
-
-    for p_dir in person_dirs:
+    for action_dir in action_dirs:
         try:
-            process_single_person(p_dir, source_root, out_root, infer_root, cfg)
-        except Exception as e:
-            logger.error(f"❌ GPU {gpu_id} 处理 {p_dir.name} 时出错: {e}")
+            process_single_action(action_dir, source_root, vis_root, infer_root, cfg)
+        except Exception as exc:
+            logger.error(
+                "[Worker %d] Failed on action %s: %s",
+                worker_id,
+                action_dir.name,
+                exc,
+            )
 
-    logger.info(f"🏁 GPU {gpu_id} 所有任务处理完毕")
-
-
-# ---------------------------------------------------------------------
-# Main 入口
-# ---------------------------------------------------------------------
-# @hydra.main(config_path="../configs", config_name="sam3d_body", version_base=None)
-# def main(cfg: DictConfig) -> None:
-#     # 1. 路径准备
-#     out_root = Path(cfg.paths.log_path).resolve()
-#     infer_root = Path(cfg.paths.result_output_path).resolve()
-#     source_root = Path(cfg.paths.video_path).resolve()
-
-#     gpu_ids = cfg.infer.get("gpu", [0, 1])  # 从配置文件读取 GPU 列表，默认 [0, 1]
-
-#     all_person_dirs = sorted([x for x in source_root.iterdir() if x.is_dir()])
-#     if not all_person_dirs:
-#         logger.error(f"未找到数据目录: {source_root}")
-#         return
-
-#     # 2. 自动分组逻辑 (Task Chunking)
-#     # 将所有目录分成 N 份，N 等于 GPU 的数量
-#     num_gpus = len(gpu_ids)
-#     # 使用 np.array_split 可以确保即使除不尽，分配也尽可能均匀
-#     chunks = np.array_split(all_person_dirs, num_gpus)
-
-#     logger.info(f"检测到 {num_gpus} 个 GPU: {gpu_ids}")
-#     for i, gpu_id in enumerate(gpu_ids):
-#         logger.info(f"  - GPU {gpu_id} 分配任务数: {len(chunks[i])}")
-
-#     # 3. 启动并行进程
-#     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-#     mp.set_start_method("spawn", force=True)
-
-#     processes = []
-#     for i, gpu_id in enumerate(gpu_ids):
-#         person_list = chunks[i].tolist()  # 转回普通列表
-#         if not person_list:
-#             continue
-
-#         p = mp.Process(
-#             target=gpu_worker,
-#             args=(
-#                 gpu_id,
-#                 person_list,
-#                 source_root,
-#                 out_root,
-#                 infer_root,
-#                 cfg_dict,
-#             ),
-#         )
-#         p.start()
-#         processes.append(p)
-
-#     # 4. 等待所有进程完成
-#     for p in processes:
-#         p.join()
-
-#     logger.info("🎉 [SUCCESS] 所有 GPU 任务已圆满完成！")
+    logger.info("[Worker %d] GPU %s finished", worker_id, gpu_id)
 
 
-# ---------------------------------------------------------------------
-# Main 入口
-# ---------------------------------------------------------------------
+def normalize_gpu_ids(raw_gpu_ids) -> List[Union[int, str]]:
+    """Normalize gpu config to a list of integer ids."""
+    if isinstance(raw_gpu_ids, str) and raw_gpu_ids.lower() == "cpu":
+        return ["cpu"]
+
+    if isinstance(raw_gpu_ids, int):
+        return [raw_gpu_ids]
+
+    if isinstance(raw_gpu_ids, str):
+        if "," in raw_gpu_ids:
+            parsed_ids: List[Union[int, str]] = []
+            for x in raw_gpu_ids.split(","):
+                x = x.strip()
+                if not x:
+                    continue
+                parsed_ids.append("cpu" if x.lower() == "cpu" else int(x))
+            return parsed_ids
+        return [int(raw_gpu_ids)]
+
+    if isinstance(raw_gpu_ids, (list, tuple)):
+        parsed_ids: List[Union[int, str]] = []
+        for x in raw_gpu_ids:
+            if isinstance(x, str) and x.lower() == "cpu":
+                parsed_ids.append("cpu")
+            else:
+                parsed_ids.append(int(x))
+        return parsed_ids
+
+    return [0]
+
+
+def select_action_shard(
+    action_dirs: List[Path],
+    shard_count: int,
+    shard_index: int,
+) -> List[Path]:
+    """Select one shard of actions for multi-node execution."""
+    if shard_count <= 1:
+        return action_dirs
+
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError(
+            f"Invalid shard index {shard_index} for shard_count {shard_count}"
+        )
+
+    shard_chunks = split_evenly(action_dirs, shard_count)
+    return shard_chunks[shard_index]
+
+
 @hydra.main(config_path="../configs", config_name="sam3d_body", version_base=None)
 def main(cfg: DictConfig) -> None:
-    # 1. 経路準備
-    out_root = Path(cfg.paths.log_path).resolve()
-    infer_root = Path(cfg.paths.result_output_path).resolve()
-    source_root = Path(cfg.paths.video_path).resolve()
+    source_root = Path(cfg.paths.unity.unity_dataset_data_path).resolve()
+    result_root = Path(cfg.paths.unity.unity_sam3d_result_root).resolve()
 
-    # --- 設定の追加 ---
-    gpu_ids = cfg.infer.get("gpu", [0, 1])  # 使用するGPUのリスト
-    workers_per_gpu = cfg.infer.get("workers_per_gpu", 2)  # 1枚あたりのプロセス数
-    
-    # 実際に起動するプロセスの数だけGPU IDを並べる (例: [0, 0, 1, 1])
-    expanded_gpu_ids = []
+    vis_root = result_root / "visualization"
+    infer_root = result_root / "inference"
+    vis_root.mkdir(parents=True, exist_ok=True)
+    infer_root.mkdir(parents=True, exist_ok=True)
+
+    gpu_ids = normalize_gpu_ids(cfg.infer.gpu)
+    workers_per_gpu = int(cfg.infer.workers_per_gpu)
+    workers_per_gpu = max(workers_per_gpu, 1)
+
+    expanded_gpu_ids: List[Union[int, str]] = []
     for gid in gpu_ids:
         expanded_gpu_ids.extend([gid] * workers_per_gpu)
-    
-    total_workers = len(expanded_gpu_ids)
-    # ------------------
 
-    all_person_dirs = sorted([x for x in source_root.iterdir() if x.is_dir()])
-    if not all_person_dirs:
-        logger.error(f"未找到数据目录: {source_root}")
+    total_workers = len(expanded_gpu_ids)
+    if total_workers < 1:
+        logger.error("No worker created. Check infer.gpu / infer.workers_per_gpu")
         return
 
-    # 2. 自動分组逻辑 (プロセスの総数で分割)
-    chunks = np.array_split(all_person_dirs, total_workers)
+    action_dirs_all = collect_action_dirs(source_root)
+    if not action_dirs_all:
+        logger.error("No action dirs found in: %s", source_root)
+        return
 
-    logger.info(f"使用 GPU: {gpu_ids} (各 {workers_per_gpu} ワーカー)")
-    logger.info(f"総プロセス数: {total_workers}")
+    shard_count = max(int(getattr(cfg.infer, "shard_count", 1)), 1)
+    shard_index = int(getattr(cfg.infer, "shard_index", 0))
 
-    # 3. 启动并行进程
+    try:
+        action_dirs = select_action_shard(action_dirs_all, shard_count, shard_index)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return
+
+    if not action_dirs:
+        logger.warning(
+            "No actions assigned to this shard (index=%d/%d). Exit.",
+            shard_index,
+            shard_count,
+        )
+        return
+
+    chunks = split_evenly(action_dirs, total_workers)
+
+    logger.info("Source data root: %s", source_root)
+    logger.info("Result root: %s", result_root)
+    logger.info("GPU ids: %s, workers_per_gpu=%d", gpu_ids, workers_per_gpu)
+    logger.info(
+        "Shard: index=%d/%d, actions_in_shard=%d, total_actions=%d",
+        shard_index,
+        shard_count,
+        len(action_dirs),
+        len(action_dirs_all),
+    )
+    logger.info("Total workers: %d, total actions: %d", total_workers, len(action_dirs))
+
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-    mp.set_start_method("spawn", force=True)
+    if not isinstance(cfg_dict, dict):
+        logger.error("Failed to convert config to dict")
+        return
 
-    processes = []
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    processes: List[mp.Process] = []
     for i, gpu_id in enumerate(expanded_gpu_ids):
-        person_list = chunks[i].tolist()
-        if not person_list:
+        action_list = chunks[i]
+        if not action_list:
             continue
 
-        logger.info(f"  - Worker {i} (GPU {gpu_id}) 分配任务数: {len(person_list)}")
+        logger.info(
+            "Assign worker=%d, gpu=%s, action_count=%d",
+            i,
+            gpu_id,
+            len(action_list),
+        )
 
-        p = mp.Process(
+        process = mp.Process(
             target=gpu_worker,
             args=(
                 gpu_id,
-                person_list,
+                action_list,
                 source_root,
-                out_root,
+                vis_root,
                 infer_root,
                 cfg_dict,
+                i,
             ),
         )
-        p.start()
-        processes.append(p)
+        process.start()
+        processes.append(process)
 
-    # 4. 等待所有进程完成
-    for p in processes:
-        p.join()
+    for process in processes:
+        process.join()
 
-    logger.info("🎉 [SUCCESS] 所有 GPU 任务已圆满完成！")
+    logger.info("[SUCCESS] All action workers completed")
+
 
 if __name__ == "__main__":
     os.environ["HYDRA_FULL_ERROR"] = "1"

@@ -5,6 +5,13 @@
       "type": "debugpy",
       "request": "launch",
       "module": "enter-your-module-name"
+    },
+    {
+      "name": "unity_sam3d_body",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "SAM3Dbody.main",
+      // "args": ["--config", "configs/sam3d_body.yaml"]
     }
   ]
 }
