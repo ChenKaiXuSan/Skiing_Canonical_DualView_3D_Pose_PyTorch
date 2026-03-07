@@ -17,6 +17,7 @@ from .load import collect_action_dirs, load_capture_frames
 
 logger = logging.getLogger(__name__)
 
+
 def split_evenly(items: List[Path], num_chunks: int) -> List[List[Path]]:
     """Split a list into near-even contiguous chunks."""
     if num_chunks <= 0:
@@ -41,13 +42,14 @@ def process_single_action(
     source_root: Path,
     vis_root: Path,
     infer_root: Path,
+    action_log_root: Path,
     cfg: DictConfig,
 ) -> None:
     """Process all captures in one action directory."""
     rel_action = action_dir.relative_to(source_root)
     action_id = str(rel_action).replace("/", "__")
 
-    log_dir = infer_root.parent / "logs" / "action_logs"
+    log_dir = action_log_root / "action_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     action_log_file = log_dir / f"{action_id}.log"
 
@@ -102,6 +104,7 @@ def gpu_worker(
     source_root: Path,
     vis_root: Path,
     infer_root: Path,
+    action_log_root: Path,
     cfg_dict: dict,
     worker_id: int,
 ) -> None:
@@ -126,7 +129,14 @@ def gpu_worker(
 
     for action_dir in action_dirs:
         try:
-            process_single_action(action_dir, source_root, vis_root, infer_root, cfg)
+            process_single_action(
+                action_dir,
+                source_root,
+                vis_root,
+                infer_root,
+                action_log_root,
+                cfg,
+            )
         except Exception as exc:
             logger.error(
                 "[Worker %d] Failed on action %s: %s",
@@ -194,6 +204,7 @@ def main(cfg: DictConfig) -> None:
 
     vis_root = result_root / "visualization"
     infer_root = result_root / "inference"
+    action_log_root = Path(cfg.paths.log_path).resolve()
     vis_root.mkdir(parents=True, exist_ok=True)
     infer_root.mkdir(parents=True, exist_ok=True)
 
@@ -277,6 +288,7 @@ def main(cfg: DictConfig) -> None:
                 source_root,
                 vis_root,
                 infer_root,
+                action_log_root,
                 cfg_dict,
                 i,
             ),
