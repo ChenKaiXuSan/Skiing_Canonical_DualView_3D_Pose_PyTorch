@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -A SSR
 #PBS -q gpu
-#PBS -l elapstim_req=24:00:00
+#PBS -l elapstim_req=20:00:00
 #PBS -N sam3d_fine_grained
 #PBS -t 0-119                         # 2 persons × 12 actions × 5 layers = 120 nodes
 #PBS -o logs/pegasus/sam3d_fine_${PBS_SUBREQNO}.log
@@ -65,7 +65,7 @@ if [ "$PERSON" == "female" ]; then
 fi
 
 # 每個 node 內的並發線程數
-THREADS_PER_NODE=6
+THREADS_PER_NODE=4
 
 echo "========================================="
 echo "Node Index: ${NODE_INDEX}"

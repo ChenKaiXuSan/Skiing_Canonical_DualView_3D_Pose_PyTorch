@@ -236,13 +236,13 @@ def process_frame_list(
     del visualizer
 
     # 保存未检测到人的帧号
-    if none_detected_frames:
+    if none_detected_indices:
         none_detected_frames_file = inference_output_path / "none_detected_frames.txt"
         with open(none_detected_frames_file, "w") as f:
-            for frame_idx in none_detected_frames:
+            for frame_idx in none_detected_indices:
                 f.write(f"{frame_idx}\n")
         logger.info(
-            f"⚠️ 共 {len(none_detected_frames)} 帧未检测到人物，已保存至 {none_detected_frames_file}"
+            f"⚠️ 共 {len(none_detected_indices)} 帧未检测到人物，已保存至 {none_detected_frames_file}"
         )
 
     return out_dir

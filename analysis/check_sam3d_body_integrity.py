@@ -24,11 +24,11 @@ NPZ_PATTERN = re.compile(r"^(\d+)_sam3d_body\.npz$")
 CAMERA_PATTERN = re.compile(r"^capture_L(\d+)_A(\d{3})$")
 EXPECTED_LEVELS = set(range(5))
 EXPECTED_ANGLES = set(range(0, 360, 10))
-# DEFAULT_SOURCE_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/data")
-DEFAULT_SOURCE_ROOT = Path("/workspace/data/skiing_unity_dataset/data")
+DEFAULT_SOURCE_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/data")
+# DEFAULT_SOURCE_ROOT = Path("/workspace/data/skiing_unity_dataset/data")
 
-# DEFAULT_RESULT_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/sam3d_body_results")
-DEFAULT_RESULT_ROOT = Path("/workspace/data/skiing_unity_dataset/sam3d_body_results")
+DEFAULT_RESULT_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/sam3d_body_results")
+# DEFAULT_RESULT_ROOT = Path("/workspace/data/skiing_unity_dataset/sam3d_body_results")
 
 
 @dataclass
