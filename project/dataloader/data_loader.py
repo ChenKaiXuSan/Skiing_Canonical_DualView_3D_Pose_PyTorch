@@ -24,8 +24,6 @@ from typing import Any, Callable, Dict, Optional
 
 import torch
 from pytorch_lightning import LightningDataModule
-from pytorchvideo.data import make_clip_sampler
-from pytorchvideo.data.labeled_video_dataset import labeled_video_dataset
 from torch.utils.data import DataLoader
 from torchvision.transforms import (
     Compose,
@@ -39,7 +37,7 @@ from project.dataloader.utils import (
 )
 
 
-class DriverDataModule(LightningDataModule):
+class UnityDataModule(LightningDataModule):
     def __init__(self, opt, dataset_idx: Dict = None):
         super().__init__()
 
@@ -48,9 +46,6 @@ class DriverDataModule(LightningDataModule):
         self._num_workers = opt.data.num_workers
         self._img_size = opt.data.img_size
 
-        # frame rate
-        self._clip_duration = opt.train.clip_duration
-        self.uniform_temporal_subsample_num = opt.train.uniform_temporal_subsample_num
 
         # * this is the dataset idx, which include the train/val dataset idx.
         self._dataset_idx = dataset_idx
@@ -62,7 +57,6 @@ class DriverDataModule(LightningDataModule):
 
         self.mapping_transform = Compose(
             [
-                UniformTemporalSubsample(self.uniform_temporal_subsample_num),
                 Div255(),
                 Resize(size=[self._img_size, self._img_size]),
             ]

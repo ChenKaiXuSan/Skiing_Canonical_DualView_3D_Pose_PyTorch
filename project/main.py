@@ -20,40 +20,157 @@ Date      	By	Comments
 ----------	---	---------------------------------------------------------
 """
 
-import os
+import json
 import logging
+import os
+from pathlib import Path
+from typing import Dict, List
+
 import hydra
 from omegaconf import DictConfig
-
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 from pytorch_lightning.callbacks import (
-    TQDMProgressBar,
-    RichModelSummary,
-    ModelCheckpoint,
+    DeviceStatsMonitor,
     EarlyStopping,
     LearningRateMonitor,
-    DeviceStatsMonitor,
+    ModelCheckpoint,
+    RichModelSummary,
+    TQDMProgressBar,
 )
+from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
 
-from project.dataloader.data_loader import DriverDataModule
+from project.dataloader.data_loader import UnityDataModule
 
 #####################################
 # select different experiment trainer
 #####################################
-
 # baseline
 from project.trainer.baseline.train_3dcnn import Res3DCNNTrainer
+from project.trainer.early.train_early_fusion import EarlyFusion3DCNNTrainer
+from project.trainer.late.train_late_fusion import LateFusion3DCNNTrainer
 
 # attention based
 from project.trainer.mid.train_pose_attn import PoseAttnTrainer
 from project.trainer.mid.train_se_attn import SEAttnTrainer
-from project.trainer.early.train_early_fusion import EarlyFusion3DCNNTrainer
-from project.trainer.late.train_late_fusion import LateFusion3DCNNTrainer
-
-from project.cross_validation import DefineCrossValidation
+from project.map_config import UnityDataConfig
 
 logger = logging.getLogger(__name__)
+
+
+def load_fold_dataset_idx_from_index_mapping(config: DictConfig):
+    """Load precomputed fold mapping from index json file.
+
+    This removes CV split preparation from training entry.
+    """
+    index_mapping_cfg = Path(str(config.data.index_mapping))
+    index_file_name = str(config.data.index_mapping_file)
+
+    # Backward/forward compatible:
+    # 1) data.index_mapping points to directory + data.index_mapping_file
+    # 2) data.index_mapping points directly to a json file
+    if index_mapping_cfg.suffix == ".json":
+        index_file = index_mapping_cfg
+    else:
+        index_file = index_mapping_cfg / index_file_name
+
+    if not index_file.exists():
+        raise FileNotFoundError(
+            f"Index mapping file not found: {index_file}. "
+            f"Please generate it first (e.g. cross_validation/generate_cv_index.py)."
+        )
+
+    with open(index_file, "r", encoding="utf-8") as f:
+        serial = json.load(f)
+
+    # Skip metadata entry if exists.
+    serial.pop("_metadata", None)
+
+    fold_dataset_idx: Dict[int, Dict[str, List[UnityDataConfig]]] = {}
+    for kfold, d in serial.items():
+        if not isinstance(d, dict):
+            raise ValueError(f"Fold {kfold} must be a dict, got {type(d)}")
+
+        fold = int(kfold)
+        fold_dataset_idx[fold] = {"train": [], "val": []}
+
+        # Accept both val/valid naming from different generators.
+        split_aliases = {"train": ["train"], "val": ["val", "valid"]}
+
+        for split, aliases in split_aliases.items():
+            src_list = None
+            for alias in aliases:
+                if alias in d:
+                    src_list = d[alias]
+                    break
+            if src_list is None:
+                raise KeyError(
+                    f"Fold {kfold} missing split '{split}' (aliases: {aliases})"
+                )
+            if not isinstance(src_list, list):
+                raise TypeError(
+                    f"Fold {kfold} split '{split}' must be a list, got {type(src_list)}"
+                )
+
+            for item in src_list:
+                if not isinstance(item, dict):
+                    raise TypeError(
+                        f"Index item in fold {kfold}/{split} must be dict, got {type(item)}"
+                    )
+
+                # camera-pair index format: build UnityDataConfig directly.
+                if "cam1_frames_dir" in item and "cam2_frames_dir" in item:
+                    required_fields = [
+                        "person_id",
+                        "action_id",
+                        "cam1_id",
+                        "cam2_id",
+                        "cam1_path",
+                        "cam2_path",
+                        "label_path",
+                        "cam1_frames_dir",
+                        "cam2_frames_dir",
+                        "cam1_kpt2d_dir",
+                        "cam2_kpt2d_dir",
+                        "kpt3d_dir",
+                        "sam3d_cam1_dir",
+                        "sam3d_cam2_dir",
+                        "sequence_meta_path",
+                        "joint_names_path",
+                    ]
+                    missing = [k for k in required_fields if k not in item]
+                    if missing:
+                        raise KeyError(
+                            f"Fold {kfold}/{split} missing required UnityDataConfig keys: {missing}"
+                        )
+
+                    fold_dataset_idx[fold][split].append(
+                        UnityDataConfig(
+                            person_id=str(item["person_id"]),
+                            action_id=str(item["action_id"]),
+                            cam1_id=str(item["cam1_id"]),
+                            cam2_id=str(item["cam2_id"]),
+                            cam1_path=str(item["cam1_path"]),
+                            cam2_path=str(item["cam2_path"]),
+                            label_path=str(item["label_path"]),
+                            cam1_frames_dir=str(item["cam1_frames_dir"]),
+                            cam2_frames_dir=str(item["cam2_frames_dir"]),
+                            cam1_kpt2d_dir=str(item["cam1_kpt2d_dir"]),
+                            cam2_kpt2d_dir=str(item["cam2_kpt2d_dir"]),
+                            kpt3d_dir=str(item["kpt3d_dir"]),
+                            sam3d_cam1_dir=str(item["sam3d_cam1_dir"]),
+                            sam3d_cam2_dir=str(item["sam3d_cam2_dir"]),
+                            sequence_meta_path=str(item["sequence_meta_path"]),
+                            joint_names_path=str(item["joint_names_path"]),
+                        )
+                    )
+                    continue
+
+                raise ValueError(
+                    "Unsupported index item format. "
+                    f"Expected camera-pair fields, got keys: {list(item.keys())}"
+                )
+
+    return fold_dataset_idx
 
 
 def train(hparams: DictConfig, dataset_idx, fold: int):
@@ -74,7 +191,6 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
     # TODO: add more experiment trainer here.
     if hparams.train.view == "multi":
         if hparams.model.backbone == "3dcnn":
-
             if hparams.model.fuse_method in ["add", "mul", "concat", "avg"]:
                 classification_module = EarlyFusion3DCNNTrainer(hparams)
             elif hparams.model.fuse_method == "late":
@@ -89,28 +205,21 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
         raise ValueError("the experiment view is not supported.")
 
     # * prepare data module
-    data_module = DriverDataModule(hparams, dataset_idx)
+    data_module = UnityDataModule(hparams, dataset_idx)
 
     # for the tensorboard
     tb_logger = TensorBoardLogger(
         save_dir=os.path.join(hparams.log_path, "tb_logs"),
         name="fold_" + str(fold),  # here should be str type.
     )
-
-    cvs_logger = CSVLogger(
-        save_dir=os.path.join(hparams.log_path, "csv_logs"),
-        name="fold_" + str(fold) + "_csv",  # here should be str type.
-    )
-
+    
     # some callbacks
     progress_bar = TQDMProgressBar(refresh_rate=10)
     rich_model_summary = RichModelSummary(max_depth=2)
 
     # define the checkpoint becavier.
     model_check_point = ModelCheckpoint(
-        dirpath=os.path.join(
-            hparams.log_path, "checkpoints", "fold_" + str(fold)
-        ),
+        dirpath=os.path.join(hparams.log_path, "checkpoints", "fold_" + str(fold)),
         filename="{epoch}-{val/loss:.2f}-{val/video_acc:.4f}",
         auto_insert_metric_name=False,
         monitor="val/video_acc",
@@ -137,7 +246,7 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
         logger=[tb_logger],
         check_val_every_n_epoch=1,
         callbacks=[
-            # progress_bar,
+            progress_bar,
             rich_model_summary,
             model_check_point,
             early_stopping,
@@ -165,11 +274,8 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
     config_name="train.yaml",
 )
 def init_params(config):
-    #######################
-    # prepare dataset index
-    #######################
-
-    fold_dataset_idx = DefineCrossValidation(config)()
+    # Load precomputed fold mapping only; do not prepare CV splits here.
+    fold_dataset_idx = load_fold_dataset_idx_from_index_mapping(config)
 
     logger.info("#" * 50)
     logger.info("Start train all fold")

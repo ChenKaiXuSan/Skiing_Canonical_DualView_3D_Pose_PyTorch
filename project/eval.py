@@ -36,7 +36,7 @@ from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import DeviceStatsMonitor
 
 # DataModule
-from project.dataloader.data_loader import DriverDataModule
+from project.dataloader.data_loader import UnityDataModule
 
 # Trainers (LightningModules)
 from project.trainer.baseline.train_3dcnn import Res3DCNNTrainer

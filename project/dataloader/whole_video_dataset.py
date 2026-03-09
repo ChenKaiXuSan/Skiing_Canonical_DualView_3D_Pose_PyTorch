@@ -2,71 +2,497 @@
 # -*- coding:utf-8 -*-
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 import logging
+import re
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Literal, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
+import cv2
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-from torchvision.io import read_video
 
-from project.dataloader.prepare_label_dict import prepare_label_dict
-from project.map_config import VideoSample, label_mapping_Dict
+from project.map_config import ID_TO_INDEX, TARGET_IDS, UnityDataConfig
 
 logger = logging.getLogger(__name__)
 
-ViewName = Literal["front", "left", "right"]
 
-
-class LabeledVideoDataset(Dataset):
+class LabeledUnityDataset(Dataset):
     """
     Multi-view labeled video dataset.
-
-    Output:
-        sample["video"][view] : Tensor (B, T, C, H, W)  # segments split by label timeline
-        sample["label"]       : LongTensor (B,)
-        sample["label_info"]  : List[str]
-        sample["meta"]        : dict
     """
 
     def __init__(
         self,
         experiment: str,
-        index_mapping: List[Sample],
+        index_mapping: UnityDataConfig,
         transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        decode_audio: bool = False,
     ) -> None:
         super().__init__()
         self._experiment = experiment
         self._index_mapping = index_mapping
         self._transform = transform
-        self._decode_audio = bool(decode_audio)
-
-        # label mapping: {class_id: "label_name"} -> {"label_name": class_id}
-        self._label_to_id: Dict[str, int] = {
-            v: int(k) for k, v in label_mapping_Dict.items()
-        }
+        self._source_index_cache: Dict[int, List[int]] = {}
 
     def __len__(self) -> int:
         return len(self._index_mapping)
 
-    # ---------------- IO ----------------
-    def _load_one_view(self, path: Path) -> Tuple[torch.Tensor, int]:
-        """
-        Load one view video and return (video_tchw, fps).
+    @staticmethod
+    def _ordered_target_ids() -> List[int]:
+        # Keep target joint order consistent with ID_TO_INDEX.
+        return [jid for jid, _ in sorted(ID_TO_INDEX.items(), key=lambda kv: kv[1])]
 
-        read_video(output_format="TCHW") returns:
-            vframes: (T, C, H, W)
+    @classmethod
+    def _select_source_joint_indices(cls, num_joints: int) -> List[int]:
+        """Map configured target ids to source array indices.
+
+        Priority:
+          1) one-based id -> zero-based index (jid - 1)
+          2) direct index (jid)
+          3) compact target index from ID_TO_INDEX
         """
-        vframes, aframes, info = read_video(
-            str(path),
-            pts_unit="sec",
-            output_format="TCHW",
+        selected: List[int] = []
+        for jid in cls._ordered_target_ids():
+            candidates = (jid - 1, jid, ID_TO_INDEX[jid])
+            src_idx = next((c for c in candidates if 0 <= c < num_joints), None)
+            if src_idx is None:
+                raise IndexError(
+                    f"Target joint id {jid} cannot be mapped for source joint count {num_joints}."
+                )
+            selected.append(int(src_idx))
+        return selected
+
+    def _get_or_build_source_joint_indices(self, num_joints: int) -> List[int]:
+        cached = self._source_index_cache.get(num_joints)
+        if cached is not None:
+            return cached
+        selected = self._select_source_joint_indices(num_joints)
+        self._source_index_cache[num_joints] = selected
+        return selected
+
+    @staticmethod
+    def _filter_keypoints_with_indices(
+        arr: np.ndarray, source_indices: List[int]
+    ) -> np.ndarray:
+        """Fast-path keypoint filtering using precomputed source indices."""
+        kpt = np.asarray(arr, dtype=np.float32)
+        if kpt.ndim == 3 and kpt.shape[0] == 1:
+            kpt = kpt[0]
+        if kpt.ndim != 2:
+            raise ValueError(f"Expected keypoints shape (J,C), got {kpt.shape}")
+        if max(source_indices) >= kpt.shape[0]:
+            raise IndexError(
+                f"Source index out of range for shape {kpt.shape} and indices up to {max(source_indices)}"
+            )
+        return kpt[source_indices]
+
+    @classmethod
+    def _filter_keypoints_by_target_ids(cls, arr: np.ndarray) -> np.ndarray:
+        """Filter keypoints to configured TARGET_IDS in a fixed order."""
+        kpt = np.asarray(arr, dtype=np.float32)
+        if kpt.ndim == 3 and kpt.shape[0] == 1:
+            kpt = kpt[0]
+        if kpt.ndim != 2:
+            raise ValueError(f"Expected keypoints shape (J,C), got {kpt.shape}")
+
+        # Ensure mapping uses the configured target ids.
+        if len(TARGET_IDS) != len(ID_TO_INDEX):
+            raise ValueError("TARGET_IDS and ID_TO_INDEX are inconsistent in size.")
+
+        source_indices = cls._select_source_joint_indices(kpt.shape[0])
+        return cls._filter_keypoints_with_indices(kpt, source_indices)
+
+    @staticmethod
+    def _item_get(item: Any, key: str, default: Any = None) -> Any:
+        if isinstance(item, dict):
+            return item.get(key, default)
+        return getattr(item, key, default)
+
+    @staticmethod
+    def _normalize_item_dict(item: Any) -> Dict[str, Any]:
+        if isinstance(item, dict):
+            return item
+        if is_dataclass(item) and not isinstance(item, type):
+            return asdict(cast(Any, item))
+        if hasattr(item, "__dict__"):
+            return dict(item.__dict__)
+        raise TypeError(f"Unsupported index item type: {type(item)}")
+
+    @staticmethod
+    def _load_frames_dir(path: Path) -> torch.Tensor:
+        """Load image sequence directory into (T,C,H,W)."""
+        if not path.exists() or not path.is_dir():
+            raise FileNotFoundError(f"Frame directory not found: {path}")
+
+        frame_files = sorted(path.glob("*.png"))
+        if len(frame_files) == 0:
+            frame_files = sorted(path.glob("*.jpg"))
+        if len(frame_files) == 0:
+            raise RuntimeError(f"No frame files found in: {path}")
+
+        frames = []
+        for p in frame_files:
+            img_bgr = cv2.imread(str(p), cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                raise RuntimeError(f"Failed to read frame: {p}")
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            frames.append(
+                torch.from_numpy(np.ascontiguousarray(img_rgb)).permute(2, 0, 1)
+            )
+        return torch.stack(frames, dim=0)
+
+    @staticmethod
+    def _extract_last_int(name: str) -> int:
+        nums = re.findall(r"(\d+)", name)
+        if not nums:
+            raise ValueError(f"No frame index found in filename: {name}")
+
+        # Prefer 6-digit frame indices (e.g. frame_000012, kpt2d_000012, 000012_sam3d_body).
+        six_digits = [x for x in nums if len(x) >= 6]
+        if six_digits:
+            return int(six_digits[0])
+
+        # Fallback for uncommon naming.
+        return int(nums[-1])
+
+    @classmethod
+    def _build_idx_file_map(cls, root: Path, pattern: str) -> Dict[int, Path]:
+        if not root.exists() or not root.is_dir():
+            return {}
+        out: Dict[int, Path] = {}
+        for p in sorted(root.glob(pattern)):
+            idx = cls._extract_last_int(p.stem)
+            out[idx] = p
+        return out
+
+    @staticmethod
+    def _load_sam3d_file(npz_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+        """Load SAM3D 2D/3D keypoints from one npz file.
+
+        Returns:
+            (sam_2d, sam_3d)
+        """
+        data = np.load(npz_path, allow_pickle=True)
+        if "output" not in data.files:
+            raise KeyError(f"Missing 'output' in SAM npz: {npz_path}")
+        output = data["output"]
+        if isinstance(output, np.ndarray) and output.shape == ():
+            output = output.item()
+
+        if not isinstance(output, dict):
+            raise TypeError(f"Unexpected SAM output type in {npz_path}: {type(output)}")
+
+        if "pred_keypoints_3d" in output:
+            arr_3d = output["pred_keypoints_3d"]
+        elif "pred_joint_coords" in output:
+            arr_3d = output["pred_joint_coords"]
+        else:
+            raise KeyError(
+                f"No 3D keypoint key found in SAM output: {npz_path}, keys={list(output.keys())}"
+            )
+
+        if "pred_keypoints_2d" in output:
+            arr_2d = output["pred_keypoints_2d"]
+        else:
+            # fallback: keep first 2 dims from 3d keypoints for compatibility
+            arr_2d = np.asarray(arr_3d, dtype=np.float32)[..., :2]
+
+        return np.asarray(arr_2d, dtype=np.float32), np.asarray(
+            arr_3d, dtype=np.float32
         )
-        fps = int(info.get("video_fps", 0))
-        if fps <= 0:
-            raise ValueError(f"Invalid fps={fps} for video: {path}")
-        return vframes, fps
+
+    @staticmethod
+    def _temporal_resample_indices(src_len: int, dst_len: int) -> torch.Tensor:
+        if src_len <= 0:
+            raise ValueError("src_len must be > 0")
+        if dst_len <= 0:
+            raise ValueError("dst_len must be > 0")
+        if src_len == dst_len:
+            return torch.arange(src_len, dtype=torch.long)
+        # Same strategy as uniform temporal sampling: evenly spaced indices.
+        return torch.linspace(0, src_len - 1, steps=dst_len).long()
+
+    @staticmethod
+    def _extract_cam_ide_token(cam_id: Any) -> str:
+        """Extract comparable IDE token from camera id (e.g. L2_A001 -> A001)."""
+        cam_str = str(cam_id)
+        if "_" in cam_str:
+            return cam_str.split("_")[-1]
+        return cam_str
+
+    def _validate_stereo_pair_consistency(
+        self,
+        item: Dict[str, Any],
+        cam1_frames_t: torch.Tensor,
+        cam2_frames_t: torch.Tensor,
+        cam1_kpt2d_t: torch.Tensor,
+        cam2_kpt2d_t: torch.Tensor,
+        sam2d_cam1_t: torch.Tensor,
+        sam2d_cam2_t: torch.Tensor,
+        sam3d_cam1_t: torch.Tensor,
+        sam3d_cam2_t: torch.Tensor,
+        frame_indices_t: torch.Tensor,
+    ) -> None:
+        """Validate left/right camera shape alignment and camera IDE consistency."""
+        if cam1_frames_t.shape != cam2_frames_t.shape:
+            raise ValueError(
+                f"Left/right frame shape mismatch: {tuple(cam1_frames_t.shape)} vs {tuple(cam2_frames_t.shape)}"
+            )
+
+        if cam1_kpt2d_t.shape != cam2_kpt2d_t.shape:
+            raise ValueError(
+                f"Left/right GT 2D shape mismatch: {tuple(cam1_kpt2d_t.shape)} vs {tuple(cam2_kpt2d_t.shape)}"
+            )
+
+        if sam2d_cam1_t.shape != sam2d_cam2_t.shape:
+            raise ValueError(
+                f"Left/right SAM 2D shape mismatch: {tuple(sam2d_cam1_t.shape)} vs {tuple(sam2d_cam2_t.shape)}"
+            )
+
+        if sam3d_cam1_t.shape != sam3d_cam2_t.shape:
+            raise ValueError(
+                f"Left/right SAM 3D shape mismatch: {tuple(sam3d_cam1_t.shape)} vs {tuple(sam3d_cam2_t.shape)}"
+            )
+
+        # Temporal consistency: frame tensors are (B,C,T,H,W), keypoints are (T,J,C).
+        t_frames = int(cam1_frames_t.shape[2])
+        if frame_indices_t.numel() != t_frames:
+            raise ValueError(
+                f"frame_indices length {int(frame_indices_t.numel())} != frame T {t_frames}"
+            )
+        if int(cam1_kpt2d_t.shape[0]) != t_frames:
+            raise ValueError(
+                f"GT 2D T {int(cam1_kpt2d_t.shape[0])} != frame T {t_frames}"
+            )
+        if int(sam2d_cam1_t.shape[0]) != t_frames:
+            raise ValueError(
+                f"SAM 2D T {int(sam2d_cam1_t.shape[0])} != frame T {t_frames}"
+            )
+        if int(sam3d_cam1_t.shape[0]) != t_frames:
+            raise ValueError(
+                f"SAM 3D T {int(sam3d_cam1_t.shape[0])} != frame T {t_frames}"
+            )
+
+        cam1_id = item.get("cam1_id", "")
+        cam2_id = item.get("cam2_id", "")
+        if not cam1_id or not cam2_id:
+            raise ValueError(
+                f"Missing camera id(s): cam1_id={cam1_id!r}, cam2_id={cam2_id!r}"
+            )
+        if str(cam1_id) == str(cam2_id):
+            raise ValueError(f"cam1_id and cam2_id must be different, got {cam1_id}")
+
+        cam1_ide = self._extract_cam_ide_token(cam1_id)
+        cam2_ide = self._extract_cam_ide_token(cam2_id)
+        if cam1_ide == cam2_ide:
+            raise ValueError(
+                f"Invalid camera pair: IDE token should differ, got {cam1_id} ({cam1_ide}) vs {cam2_id} ({cam2_ide})"
+            )
+
+    def _load_pair_modalities(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Load aligned modalities for one camera-pair sample.
+
+        Modalities:
+          - cam1/cam2 frames
+          - cam1/cam2 2D kpt
+          - GT 3D kpt
+          - SAM3D pred 3D kpt for cam1/cam2
+        """
+        cam1_frames_dir = Path(item["cam1_frames_dir"])
+        cam2_frames_dir = Path(item["cam2_frames_dir"])
+        cam1_kpt2d_dir = Path(item["cam1_kpt2d_dir"])
+        cam2_kpt2d_dir = Path(item["cam2_kpt2d_dir"])
+        kpt3d_dir = Path(item["kpt3d_dir"])
+        sam3d_cam1_dir = Path(item["sam3d_cam1_dir"])
+        sam3d_cam2_dir = Path(item["sam3d_cam2_dir"])
+
+        cam1_frames_map = self._build_idx_file_map(cam1_frames_dir, "frame_*.png")
+        cam2_frames_map = self._build_idx_file_map(cam2_frames_dir, "frame_*.png")
+        cam1_kpt2d_map = self._build_idx_file_map(cam1_kpt2d_dir, "kpt2d_*.npy")
+        cam2_kpt2d_map = self._build_idx_file_map(cam2_kpt2d_dir, "kpt2d_*.npy")
+        kpt3d_map = self._build_idx_file_map(kpt3d_dir, "frame_*.npy")
+        sam3d_cam1_map = self._build_idx_file_map(sam3d_cam1_dir, "*_sam3d_body.npz")
+        sam3d_cam2_map = self._build_idx_file_map(sam3d_cam2_dir, "*_sam3d_body.npz")
+
+        common_idx = sorted(
+            set(cam1_frames_map)
+            & set(cam2_frames_map)
+            & set(cam1_kpt2d_map)
+            & set(cam2_kpt2d_map)
+            & set(kpt3d_map)
+            & set(sam3d_cam1_map)
+            & set(sam3d_cam2_map)
+        )
+        if not common_idx:
+            raise RuntimeError(
+                "No common frame indices across frame/2d/3d/sam3d modalities for sample: "
+                f"{item.get('person_id', 'unknown')} / {item.get('action_id', 'unknown')} / "
+                f"{item.get('cam1_id', 'unknown')} - {item.get('cam2_id', 'unknown')}"
+            )
+
+        cam1_frames: List[torch.Tensor] = []
+        cam2_frames: List[torch.Tensor] = []
+        cam1_kpt2d: List[torch.Tensor] = []
+        cam2_kpt2d: List[torch.Tensor] = []
+        gt_kpt3d: List[torch.Tensor] = []
+        sam2d_cam1: List[torch.Tensor] = []
+        sam2d_cam2: List[torch.Tensor] = []
+        sam3d_cam1: List[torch.Tensor] = []
+        sam3d_cam2: List[torch.Tensor] = []
+
+        cam1_2d_sel: Optional[List[int]] = None
+        cam2_2d_sel: Optional[List[int]] = None
+        gt_3d_sel: Optional[List[int]] = None
+        sam1_2d_sel: Optional[List[int]] = None
+        sam2_2d_sel: Optional[List[int]] = None
+        sam1_3d_sel: Optional[List[int]] = None
+        sam2_3d_sel: Optional[List[int]] = None
+
+        for idx in common_idx:
+            # frames
+            img1 = cv2.imread(str(cam1_frames_map[idx]), cv2.IMREAD_COLOR)
+            img2 = cv2.imread(str(cam2_frames_map[idx]), cv2.IMREAD_COLOR)
+            if img1 is None or img2 is None:
+                raise RuntimeError(f"Failed to read aligned frame at idx={idx}")
+
+            img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
+            img2 = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)
+            cam1_frames.append(
+                torch.from_numpy(np.ascontiguousarray(img1)).permute(2, 0, 1)
+            )
+            cam2_frames.append(
+                torch.from_numpy(np.ascontiguousarray(img2)).permute(2, 0, 1)
+            )
+
+            # keypoints
+            cam1_raw = np.load(cam1_kpt2d_map[idx])
+            cam2_raw = np.load(cam2_kpt2d_map[idx])
+            gt3d_raw = np.load(kpt3d_map[idx])
+
+            if cam1_2d_sel is None:
+                cam1_arr = np.asarray(cam1_raw, dtype=np.float32)
+                if cam1_arr.ndim == 3 and cam1_arr.shape[0] == 1:
+                    cam1_arr = cam1_arr[0]
+                cam1_2d_sel = self._get_or_build_source_joint_indices(cam1_arr.shape[0])
+            if cam2_2d_sel is None:
+                cam2_arr = np.asarray(cam2_raw, dtype=np.float32)
+                if cam2_arr.ndim == 3 and cam2_arr.shape[0] == 1:
+                    cam2_arr = cam2_arr[0]
+                cam2_2d_sel = self._get_or_build_source_joint_indices(cam2_arr.shape[0])
+            if gt_3d_sel is None:
+                gt3d_arr = np.asarray(gt3d_raw, dtype=np.float32)
+                if gt3d_arr.ndim == 3 and gt3d_arr.shape[0] == 1:
+                    gt3d_arr = gt3d_arr[0]
+                gt_3d_sel = self._get_or_build_source_joint_indices(gt3d_arr.shape[0])
+
+            cam1_kpt2d_np = self._filter_keypoints_with_indices(cam1_raw, cam1_2d_sel)
+            cam2_kpt2d_np = self._filter_keypoints_with_indices(cam2_raw, cam2_2d_sel)
+            gt_kpt3d_np = self._filter_keypoints_with_indices(gt3d_raw, gt_3d_sel)
+
+            cam1_kpt2d.append(torch.from_numpy(cam1_kpt2d_np))
+            cam2_kpt2d.append(torch.from_numpy(cam2_kpt2d_np))
+            gt_kpt3d.append(torch.from_numpy(gt_kpt3d_np))
+
+            sam1_2d, sam1_3d = self._load_sam3d_file(sam3d_cam1_map[idx])
+            sam2_2d, sam2_3d = self._load_sam3d_file(sam3d_cam2_map[idx])
+
+            if sam1_2d_sel is None:
+                sam1_2d_sel = self._get_or_build_source_joint_indices(sam1_2d.shape[0])
+            if sam2_2d_sel is None:
+                sam2_2d_sel = self._get_or_build_source_joint_indices(sam2_2d.shape[0])
+            if sam1_3d_sel is None:
+                sam1_3d_sel = self._get_or_build_source_joint_indices(sam1_3d.shape[0])
+            if sam2_3d_sel is None:
+                sam2_3d_sel = self._get_or_build_source_joint_indices(sam2_3d.shape[0])
+
+            sam2d_cam1.append(
+                torch.from_numpy(
+                    self._filter_keypoints_with_indices(sam1_2d, sam1_2d_sel)
+                )
+            )
+            sam2d_cam2.append(
+                torch.from_numpy(
+                    self._filter_keypoints_with_indices(sam2_2d, sam2_2d_sel)
+                )
+            )
+            sam3d_cam1.append(
+                torch.from_numpy(
+                    self._filter_keypoints_with_indices(sam1_3d, sam1_3d_sel)
+                )
+            )
+            sam3d_cam2.append(
+                torch.from_numpy(
+                    self._filter_keypoints_with_indices(sam2_3d, sam2_3d_sel)
+                )
+            )
+
+        cam1_frames_t = torch.stack(cam1_frames, dim=0)
+        cam2_frames_t = torch.stack(cam2_frames, dim=0)
+
+        # apply same image transform to both views
+        cam1_frames_t = self._apply_transform(cam1_frames_t)
+        cam2_frames_t = self._apply_transform(cam2_frames_t)
+
+        # trainer-compatible views: (B,C,T,H,W)
+        cam1_frames_t = cam1_frames_t.permute(1, 0, 2, 3).unsqueeze(0)
+        cam2_frames_t = cam2_frames_t.permute(1, 0, 2, 3).unsqueeze(0)
+
+        # Keep keypoints temporally aligned with transformed frames.
+        t_after = int(cam1_frames_t.shape[2])
+        src_t = len(common_idx)
+        sel = self._temporal_resample_indices(src_t, t_after)
+
+        cam1_kpt2d_t = torch.stack(cam1_kpt2d, dim=0)[sel]
+        cam2_kpt2d_t = torch.stack(cam2_kpt2d, dim=0)[sel]
+        gt_kpt3d_t = torch.stack(gt_kpt3d, dim=0)[sel]
+        sam2d_cam1_t = torch.stack(sam2d_cam1, dim=0)[sel]
+        sam2d_cam2_t = torch.stack(sam2d_cam2, dim=0)[sel]
+        sam3d_cam1_t = torch.stack(sam3d_cam1, dim=0)[sel]
+        sam3d_cam2_t = torch.stack(sam3d_cam2, dim=0)[sel]
+        frame_indices_t = torch.tensor(common_idx, dtype=torch.long)[sel]
+
+        self._validate_stereo_pair_consistency(
+            item=item,
+            cam1_frames_t=cam1_frames_t,
+            cam2_frames_t=cam2_frames_t,
+            cam1_kpt2d_t=cam1_kpt2d_t,
+            cam2_kpt2d_t=cam2_kpt2d_t,
+            sam2d_cam1_t=sam2d_cam1_t,
+            sam2d_cam2_t=sam2d_cam2_t,
+            sam3d_cam1_t=sam3d_cam1_t,
+            sam3d_cam2_t=sam3d_cam2_t,
+            frame_indices_t=frame_indices_t,
+        )
+
+        return {
+            "frames": {
+                "cam1": cam1_frames_t,
+                "cam2": cam2_frames_t,
+            },
+            "kpt2d_gt": {
+                "cam1": cam1_kpt2d_t,
+                "cam2": cam2_kpt2d_t,
+            },
+            "kpt3d_gt": gt_kpt3d_t,
+            "kpt2d_sam": {
+                "cam1": sam2d_cam1_t,
+                "cam2": sam2d_cam2_t,
+            },
+            "kpt3d_sam": {
+                "cam1": sam3d_cam1_t,
+                "cam2": sam3d_cam2_t,
+            },
+            "frame_indices": frame_indices_t,
+            "meta": {
+                "experiment": self._experiment,
+                "person_id": item.get("person_id", "unknown"),
+                "action_id": item.get("action_id", "unknown"),
+                "cam1_id": item.get("cam1_id", "unknown"),
+                "cam2_id": item.get("cam2_id", "unknown"),
+                "num_aligned_frames": int(frame_indices_t.numel()),
+            },
+        }
 
     def _apply_transform(self, video_tchw: torch.Tensor) -> torch.Tensor:
         """
@@ -78,190 +504,28 @@ class LabeledVideoDataset(Dataset):
             return video_tchw
         return self._transform(video_tchw)
 
-    # ---------------- Timeline utils ----------------
-    @staticmethod
-    def _fill_tail_as_front(
-        timeline: List[Dict[str, Any]],
-        total_frames: int,
-        front_label: str = "front",
-    ) -> List[Dict[str, Any]]:
-        """
-        If the timeline doesn't cover [0, total_frames), fill uncovered gaps as front.
-        Assumes timeline items have int-like start/end and end is exclusive.
-        """
-        if total_frames <= 0:
-            return []
-
-        # sort by start
-        tl = sorted(
-            (
-                {
-                    "start": int(x["start"]),
-                    "end": int(x["end"]),
-                    "label": str(x["label"]),
-                }
-                for x in timeline
-                if x is not None and "start" in x and "end" in x and "label" in x
-            ),
-            key=lambda d: (d["start"], d["end"]),
-        )
-
-        filled: List[Dict[str, Any]] = []
-        cur = 0
-
-        for seg in tl:
-            s, e, lb = seg["start"], seg["end"], seg["label"]
-            s = max(0, min(s, total_frames))
-            e = max(0, min(e, total_frames))
-            if e <= s:
-                continue
-
-            # gap before this seg
-            if s > cur:
-                filled.append({"start": cur, "end": s, "label": front_label})
-
-            filled.append({"start": s, "end": e, "label": lb})
-            cur = max(cur, e)
-
-        # tail gap
-        if cur < total_frames:
-            filled.append({"start": cur, "end": total_frames, "label": front_label})
-
-        return filled
-
-    def split_frame_with_label(
-        self,
-        front_view: torch.Tensor,  # (T,C,H,W)
-        left_view: torch.Tensor,  # (T,C,H,W)
-        right_view: torch.Tensor,  # (T,C,H,W)
-        timeline_list: List[Dict[str, Any]],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str], torch.LongTensor]:
-        """
-        Split video frames according to label timeline.
-
-        Returns:
-            batch_front: (B, Tseg, C, H, W)  (NOTE: variable Tseg across segments -> stacking requires equal length)
-            ...
-        Important:
-            If segments have variable length, torch.stack will fail.
-            In that case you should pad to same length or keep as list.
-        """
-        assert (
-            front_view.shape[0] == left_view.shape[0] == right_view.shape[0]
-        ), "All views must have the same number of frames"
-
-        T = int(front_view.shape[0])
-
-        # 1) fill uncovered as front
-        timeline = self._fill_tail_as_front(
-            timeline_list, total_frames=T, front_label="front"
-        )
-
-        batch_front: List[torch.Tensor] = []
-        batch_left: List[torch.Tensor] = []
-        batch_right: List[torch.Tensor] = []
-        labels: List[str] = []
-        mapped: List[int] = []
-
-        for seg in timeline:
-            s, e, lb = int(seg["start"]), int(seg["end"]), str(seg["label"])
-            if e <= s:
-                continue
-
-            seg_front = self._apply_transform(front_view[s:e])
-            seg_left = self._apply_transform(left_view[s:e])
-            seg_right = self._apply_transform(right_view[s:e])
-
-            batch_front.append(seg_front)
-            batch_left.append(seg_left)
-            batch_right.append(seg_right)
-
-            labels.append(lb)
-            mapped.append(self._label_to_id.get(lb, -1))  # unknown -> -1
-
-        # ⚠️ 如果每段长度不同，这里 stack 会报错。
-        # 你有两种选择：
-        #  A) 先 padding 到同样长度再 stack
-        #  B) 保持 list 形式返回（推荐用于变长）
-        #
-        # 这里为了兼容你原逻辑，我保留 stack，但你要确保每段长度一致或你已对 timeline 做了固定长度切分。
-        batch_front_t = torch.stack(batch_front, dim=0).permute(
-            0, 2, 1, 3, 4
-        )  # (B,T,C,H,W) > (B,C,T,H,W)
-        batch_left_t = torch.stack(batch_left, dim=0).permute(
-            0, 2, 1, 3, 4
-        )  # (B,T,C,H,W) > (B,C,T,H,W)
-        batch_right_t = torch.stack(batch_right, dim=0).permute(
-            0, 2, 1, 3, 4
-        )  # (B,T,C,H,W) > (B,C,T,H,W)
-
-        mapped_t = torch.tensor(mapped, dtype=torch.long)
-
-        return batch_front_t, batch_left_t, batch_right_t, labels, mapped_t
-
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        item = self._index_mapping[index]
+        raw_item = self._index_mapping[index]
+        item = self._normalize_item_dict(raw_item)
 
-        # load 3 views (T,C,H,W)
-        front_frames, _ = self._load_one_view(item.videos["front"])
-        left_frames, _ = self._load_one_view(item.videos["left"])
-        right_frames, _ = self._load_one_view(item.videos["right"])
+        # ---------------- camera-pair frame-dir format ----------------
+        if "cam1_frames_dir" in item and "cam2_frames_dir" in item:
+            out = self._load_pair_modalities(item)
+            out["meta"]["index"] = index
+            return out
 
-        assert (
-            front_frames.shape[0] == left_frames.shape[0] == right_frames.shape[0]
-        ), "All views must have the same number of frames"
-
-        # labels (ensure total_end = T)
-        label_dict = prepare_label_dict(
-            item.label_path, total_end=int(front_frames.shape[0])
+        raise ValueError(
+            "This dataset currently expects camera-pair index items with "
+            "cam1_frames_dir/cam2_frames_dir and corresponding kpt/sam paths."
         )
-        timeline_list = label_dict.get("timeline_list", [])
-
-        (
-            batch_front,
-            batch_left,
-            batch_right,
-            labels,
-            mapped_labels,
-        ) = self.split_frame_with_label(
-            front_frames,
-            left_frames,
-            right_frames,
-            timeline_list,
-        )
-
-        assert (
-            batch_front.shape[0]
-            == batch_left.shape[0]
-            == batch_right.shape[0]
-            == mapped_labels.shape[0]
-            == len(labels)
-        ), "Batch size mismatch after splitting"
-
-        return {
-            "video": {
-                "front": batch_front,
-                "left": batch_left,
-                "right": batch_right,
-            },
-            "label": mapped_labels,  # LongTensor (B,)
-            "label_info": labels,  # List[str]
-            "meta": {
-                "experiment": self._experiment,
-                "index": index,
-                "person_id": item.person_id,
-                "env_folder": item.env_folder,
-                "env_key": item.env_key,
-            },
-        }
 
 
 def whole_video_dataset(
     experiment: str,
-    dataset_idx: List[Sample],
+    dataset_idx: List[Any],
     transform: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-) -> LabeledVideoDataset:
-    return LabeledVideoDataset(
+) -> LabeledUnityDataset:
+    return LabeledUnityDataset(
         experiment=experiment,
         transform=transform,
         index_mapping=dataset_idx,

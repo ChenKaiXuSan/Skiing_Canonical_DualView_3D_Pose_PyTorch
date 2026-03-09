@@ -12,6 +12,15 @@
       "request": "launch",
       "module": "SAM3Dbody.main",
       // "args": ["--config", "configs/sam3d_body.yaml"]
+    },
+    {
+      "name": "unity_train",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "project.main",
+      "args": [
+       "data.num_workers=0",
+      ]
     }
   ]
 }

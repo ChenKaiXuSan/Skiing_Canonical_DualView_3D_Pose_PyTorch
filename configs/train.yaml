@@ -30,7 +30,8 @@ data:
     data_path: ${data.root_path}/data
     sam_3d_body_results_path: ${data.root_path}/sam3d_body_results/inference # 有标签的训练数据
 
-  index_mapping: ${data.root_path}/index_mapping/camera_pairs_by_action.json # training mapping path, this used for cross validation, with different class number.
+  index_mapping: ${data.root_path}/index_mapping # precomputed index mapping directory
+  index_mapping_file: camera_pairs_by_action.json # precomputed index mapping json file name
 
   num_workers: 12
   img_size: 224

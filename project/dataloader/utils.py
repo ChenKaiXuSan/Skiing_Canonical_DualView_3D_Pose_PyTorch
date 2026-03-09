@@ -24,25 +24,9 @@ Date      	By	Comments
 
 from typing import Any, Callable, Dict, Optional
 
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-
-# class UniformTemporalSubsample:
-
-#     def __init__(self, num_samples: int):
-#         self.num_samples = num_samples
-
-#     def __call__(self, video: torch.Tensor) -> torch.Tensor:
-#         """
-#         video: Tensor of shape (T, C, H, W)
-#         returns: Subsampled video of shape (num_samples, C, H, W)
-#         """
-#         # Reference: https://github.com/facebookresearch/pytorchvideo/blob/a0a131e/pytorchvideo/transforms/functional.py#L19
-#         t_max = video.shape[-4] - 1
-#         indices = torch.linspace(0, t_max, self.num_samples, device=video.device).long()
-#         return torch.index_select(video, -4, indices)
 
 
 class UniformTemporalSubsample:
