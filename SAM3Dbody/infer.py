@@ -189,6 +189,7 @@ def process_frame_list(
     # 初始化模型与可视化器
     estimator = setup_sam_3d_body(cfg)
     visualizer = setup_visualizer()
+    none_detected_indices = []
 
     for idx in tqdm(range(len(frame_list)), desc="Processing frames"):
         # if idx > 1:
@@ -205,6 +206,7 @@ def process_frame_list(
 
         if best_person is None:
             logger.warning(f"[Skip] No person detected in frame {idx}.")
+            none_detected_indices.append(idx)
             continue
 
         # 可视化并保存结果
@@ -232,5 +234,15 @@ def process_frame_list(
     torch.cuda.empty_cache()
     del estimator
     del visualizer
+
+    # 保存未检测到人的帧号
+    if none_detected_frames:
+        none_detected_frames_file = inference_output_path / "none_detected_frames.txt"
+        with open(none_detected_frames_file, "w") as f:
+            for frame_idx in none_detected_frames:
+                f.write(f"{frame_idx}\n")
+        logger.info(
+            f"⚠️ 共 {len(none_detected_frames)} 帧未检测到人物，已保存至 {none_detected_frames_file}"
+        )
 
     return out_dir
