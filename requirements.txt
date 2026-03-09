@@ -8,5 +8,11 @@ hydra-core
 # for cross validation
 scikit-learn
 
-mediapipe 
 opencv-python
+
+pytorchvideo
+seaborn
+matplotlib
+
+tensorboard
+rich
