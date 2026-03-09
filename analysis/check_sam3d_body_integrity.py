@@ -24,8 +24,11 @@ NPZ_PATTERN = re.compile(r"^(\d+)_sam3d_body\.npz$")
 CAMERA_PATTERN = re.compile(r"^capture_L(\d+)_A(\d{3})$")
 EXPECTED_LEVELS = set(range(5))
 EXPECTED_ANGLES = set(range(0, 360, 10))
-DEFAULT_SOURCE_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/data")
-DEFAULT_RESULT_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/sam3d_body_results")
+# DEFAULT_SOURCE_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/data")
+DEFAULT_SOURCE_ROOT = Path("/workspace/data/skiing_unity_dataset/data")
+
+# DEFAULT_RESULT_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/sam3d_body_results")
+DEFAULT_RESULT_ROOT = Path("/workspace/data/skiing_unity_dataset/sam3d_body_results")
 
 
 @dataclass
@@ -38,6 +41,10 @@ class CaptureCheck:
     extra_indices: List[int]
     malformed_outputs: List[str]
     corrupt_outputs: List[str]
+    none_file_exists: bool
+    none_indices: List[int]
+    none_file_invalid_lines: List[str]
+    none_mismatch_indices: List[int]
     output_dir_exists: bool
 
 
@@ -67,6 +74,9 @@ class IntegritySummary:
     captures_with_extra_frames: int
     captures_with_malformed_outputs: int
     captures_with_corrupt_outputs: int
+    captures_with_none_file: int
+    captures_with_none_parse_errors: int
+    captures_with_none_mismatch: int
     strict_mode: bool
     passed: bool
 
@@ -128,6 +138,31 @@ def parse_output_indices(output_dir: Path) -> Tuple[List[int], List[str], List[s
     return valid_indices, malformed_files, corrupt_files
 
 
+def parse_none_detected_indices(output_dir: Path) -> Tuple[bool, List[int], List[str]]:
+    """Return (exists, parsed_indices, invalid_lines)."""
+    none_file = output_dir / "none_detected_frames.txt"
+    if not none_file.exists() or not none_file.is_file():
+        return False, [], []
+
+    indices: List[int] = []
+    invalid_lines: List[str] = []
+    for raw in none_file.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            idx = int(line)
+        except ValueError:
+            invalid_lines.append(line)
+            continue
+        if idx < 0:
+            invalid_lines.append(line)
+            continue
+        indices.append(idx)
+
+    return True, sorted(set(indices)), invalid_lines
+
+
 def check_integrity(source_root: Path, result_root: Path) -> Tuple[IntegritySummary, List[CaptureCheck]]:
     action_dirs = split_action_dirs(source_root)
     person_names = {
@@ -180,12 +215,14 @@ def check_integrity(source_root: Path, result_root: Path) -> Tuple[IntegritySumm
 
             output_dir = result_root / "inference" / rel_capture
             indices, malformed, corrupt = parse_output_indices(output_dir)
+            none_file_exists, none_indices, none_invalid_lines = parse_none_detected_indices(output_dir)
 
             actual_set = set(indices)
             expected_set = set(range(n_src))
 
             missing = sorted(expected_set - actual_set)
             extra = sorted(actual_set - expected_set)
+            none_mismatch = sorted(set(missing).symmetric_difference(set(none_indices)))
 
             n_out = len(indices)
             total_output_npz += n_out
@@ -201,6 +238,10 @@ def check_integrity(source_root: Path, result_root: Path) -> Tuple[IntegritySumm
                     extra_indices=extra,
                     malformed_outputs=malformed,
                     corrupt_outputs=corrupt,
+                    none_file_exists=none_file_exists,
+                    none_indices=none_indices,
+                    none_file_invalid_lines=none_invalid_lines,
+                    none_mismatch_indices=none_mismatch,
                     output_dir_exists=output_dir.exists() and output_dir.is_dir(),
                 )
             )
@@ -262,6 +303,9 @@ def check_integrity(source_root: Path, result_root: Path) -> Tuple[IntegritySumm
         captures_with_extra_frames=sum(1 for c in checks if len(c.extra_indices) > 0),
         captures_with_malformed_outputs=sum(1 for c in checks if len(c.malformed_outputs) > 0),
         captures_with_corrupt_outputs=sum(1 for c in checks if len(c.corrupt_outputs) > 0),
+        captures_with_none_file=sum(1 for c in checks if c.none_file_exists),
+        captures_with_none_parse_errors=sum(1 for c in checks if len(c.none_file_invalid_lines) > 0),
+        captures_with_none_mismatch=sum(1 for c in checks if len(c.none_mismatch_indices) > 0),
         strict_mode=False,
         passed=False,
     )
@@ -297,6 +341,9 @@ def print_report(summary: IntegritySummary, checks: Sequence[CaptureCheck], show
     print(f"captures with extra frames: {summary.captures_with_extra_frames}")
     print(f"captures with malformed outputs: {summary.captures_with_malformed_outputs}")
     print(f"captures with corrupt outputs: {summary.captures_with_corrupt_outputs}")
+    print(f"captures with none file: {summary.captures_with_none_file}")
+    print(f"captures with none parse errors: {summary.captures_with_none_parse_errors}")
+    print(f"captures with none mismatch: {summary.captures_with_none_mismatch}")
     print(f"strict mode: {summary.strict_mode}")
     print(f"passed: {summary.passed}")
 
@@ -308,6 +355,8 @@ def print_report(summary: IntegritySummary, checks: Sequence[CaptureCheck], show
         or c.extra_indices
         or c.malformed_outputs
         or c.corrupt_outputs
+        or c.none_file_invalid_lines
+        or c.none_mismatch_indices
     ]
 
     if not problems:
@@ -328,6 +377,10 @@ def print_report(summary: IntegritySummary, checks: Sequence[CaptureCheck], show
             print(f"  malformed={len(c.malformed_outputs)} (first: {c.malformed_outputs[:5]})")
         if c.corrupt_outputs:
             print(f"  corrupt={len(c.corrupt_outputs)} (first: {c.corrupt_outputs[:5]})")
+        if c.none_file_invalid_lines:
+            print(f"  none_parse_errors={len(c.none_file_invalid_lines)} (first: {c.none_file_invalid_lines[:5]})")
+        if c.none_mismatch_indices:
+            print(f"  none_mismatch={len(c.none_mismatch_indices)} (first: {c.none_mismatch_indices[:10]})")
 
 
 def main() -> int:
@@ -382,6 +435,8 @@ def main() -> int:
         or summary.captures_with_extra_frames > 0
         or summary.captures_with_malformed_outputs > 0
         or summary.captures_with_corrupt_outputs > 0
+        or summary.captures_with_none_parse_errors > 0
+        or summary.captures_with_none_mismatch > 0
     )
     has_missing = summary.captures_with_missing_frames > 0
 
