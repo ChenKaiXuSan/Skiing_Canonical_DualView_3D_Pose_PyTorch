@@ -47,3 +47,15 @@ infer:
   # Multi-node sharding by action (set from PBS script)
   shard_count: 1
   shard_index: 0
+
+  # Camera layer filtering (L0-L4)
+  # Set to null/[] to process all layers, or [0, 1, 2] to process L0, L1, L2 only
+  camera_layers: null  # null = all layers, or specify [0], [0,1], [0,1,2,3,4], etc.
+
+  # Person filtering
+  # Set to null to process all persons, or specify person name like "male" or "female"
+  person_filter: null  # null = all persons, or "male", "female"
+
+  # Action filtering
+  # Set to null to process all actions, or specify action name pattern to match
+  action_filter: null  # null = all actions, or action name like "Anim_Male_Skier_Idle"

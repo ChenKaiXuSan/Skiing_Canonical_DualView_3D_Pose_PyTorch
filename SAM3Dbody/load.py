@@ -103,11 +103,17 @@ def _has_image_files(folder: Path) -> bool:
     return False
 
 
-def collect_capture_dirs(action_dir: Path) -> List[Path]:
+def collect_capture_dirs(action_dir: Path, camera_layers=None) -> List[Path]:
     """Collect camera folders under one action directory.
 
     Supported layout:
     - person/action/frames/camera
+    
+    Args:
+        action_dir: Action directory containing frames/
+        camera_layers: Optional list of layer indices (0-4) to filter.
+                      E.g., [0, 1] means only L0 and L1.
+                      None means all layers.
     """
     frames_dir = action_dir / "frames"
     if not frames_dir.is_dir():
@@ -116,10 +122,35 @@ def collect_capture_dirs(action_dir: Path) -> List[Path]:
     capture_dirs = sorted(
         [x for x in frames_dir.iterdir() if x.is_dir() and _has_image_files(x)]
     )
+    
+    # Apply camera layer filter if specified
+    if camera_layers is not None and len(camera_layers) > 0:
+        filtered_dirs = []
+        for capture_dir in capture_dirs:
+            # Expected format: capture_L{layer}_A{angle}
+            name = capture_dir.name
+            if name.startswith("capture_L"):
+                try:
+                    layer_str = name.split("_")[1]  # "L0", "L1", etc.
+                    layer_num = int(layer_str[1:])  # Extract 0, 1, 2, 3, 4
+                    if layer_num in camera_layers:
+                        filtered_dirs.append(capture_dir)
+                except (IndexError, ValueError):
+                    logger.warning("[Skip] Unexpected capture dir name: %s", name)
+            else:
+                # If not matching expected pattern, keep it (backward compatibility)
+                filtered_dirs.append(capture_dir)
+        return filtered_dirs
+    
     return capture_dirs
 
 
-def collect_action_dirs(source_root: Path) -> List[Path]:
+def collect_action_dirs(
+    source_root: Path,
+    camera_layers=None,
+    person_filter=None,
+    action_filter=None,
+) -> List[Path]:
     """Collect action directories for camera-based inference.
 
     Supported layout:
@@ -127,13 +158,27 @@ def collect_action_dirs(source_root: Path) -> List[Path]:
 
     An action directory is identified if it has a ``frames`` folder containing
     camera subdirectories with image files.
+    
+    Args:
+        source_root: Root directory containing person folders
+        camera_layers: Optional list of layer indices to filter captures
+        person_filter: Optional person name to filter (e.g., "male", "female")
+        action_filter: Optional action name to filter (exact match)
     """
     action_dirs_set = set()
 
     # Strict scan: only one level below each person directory.
     for person_dir in sorted([x for x in source_root.iterdir() if x.is_dir()]):
+        # Apply person filter
+        if person_filter is not None and person_dir.name != person_filter:
+            continue
+            
         for candidate in sorted([x for x in person_dir.iterdir() if x.is_dir()]):
-            if collect_capture_dirs(candidate):
+            # Apply action filter
+            if action_filter is not None and candidate.name != action_filter:
+                continue
+                
+            if collect_capture_dirs(candidate, camera_layers):
                 action_dirs_set.add(candidate)
 
     # Keep sorted deterministic ordering for sharding.

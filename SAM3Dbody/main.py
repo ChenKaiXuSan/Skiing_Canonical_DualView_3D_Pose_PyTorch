@@ -44,8 +44,13 @@ def process_single_action(
     infer_root: Path,
     action_log_root: Path,
     cfg: DictConfig,
+    camera_layers=None,
 ) -> None:
-    """Process all captures in one action directory."""
+    """Process all captures in one action directory.
+    
+    Args:
+        camera_layers: Optional list of layer indices (0-4) to filter captures.
+    """
     rel_action = action_dir.relative_to(source_root)
     action_id = str(rel_action).replace("/", "__")
 
@@ -63,10 +68,11 @@ def process_single_action(
     action_logger.addHandler(handler)
     action_logger.propagate = False
 
-    action_logger.info("==== Start Action: %s ====", rel_action)
+    layer_info = f"layers={camera_layers}" if camera_layers else "all_layers"
+    action_logger.info("==== Start Action: %s [%s] ====", rel_action, layer_info)
 
-    frames_dir = action_dir / "frames"
-    capture_dirs = sorted([x for x in frames_dir.iterdir() if x.is_dir()])
+    from .load import collect_capture_dirs
+    capture_dirs = collect_capture_dirs(action_dir, camera_layers)
     if not capture_dirs:
         action_logger.warning("[Skip] No capture dirs in: %s", frames_dir)
         return
@@ -97,7 +103,8 @@ def process_single_action(
             cfg=cfg,
         )
 
-    action_logger.info("==== Finished Action: %s ====", rel_action)
+    layer_info = f"layers={camera_layers}" if camera_layers else "all_layers"
+    action_logger.info("==== Finished Action: %s [%s] ====", rel_action, layer_info)
 
 
 def gpu_worker(
@@ -109,8 +116,13 @@ def gpu_worker(
     action_log_root: Path,
     cfg_dict: dict,
     worker_id: int,
+    camera_layers=None,
 ) -> None:
-    """Worker entrypoint: pin device and process assigned actions."""
+    """Worker entrypoint: pin device and process assigned actions.
+    
+    Args:
+        camera_layers: Optional list of layer indices to filter captures.
+    """
     is_cpu = isinstance(gpu_id, str) and gpu_id.lower() == "cpu"
     if is_cpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -122,11 +134,13 @@ def gpu_worker(
     local_cfg_dict["infer"]["gpu"] = "cpu" if is_cpu else 0
     cfg = OmegaConf.create(local_cfg_dict)
 
+    layer_info = f"layers={camera_layers}" if camera_layers else "all_layers"
     logger.info(
-        "[Worker %d] GPU %s started, actions=%d",
+        "[Worker %d] GPU %s started, actions=%d [%s]",
         worker_id,
         gpu_id,
         len(action_dirs),
+        layer_info,
     )
 
     for action_dir in action_dirs:
@@ -138,6 +152,7 @@ def gpu_worker(
                 infer_root,
                 action_log_root,
                 cfg,
+                camera_layers,
             )
         except Exception as exc:
             logger.error(
@@ -210,6 +225,26 @@ def main(cfg: DictConfig) -> None:
     vis_root.mkdir(parents=True, exist_ok=True)
     infer_root.mkdir(parents=True, exist_ok=True)
 
+    # Parse camera layer filter
+    camera_layers = getattr(cfg.infer, "camera_layers", None)
+    if camera_layers is not None and not isinstance(camera_layers, (list, tuple)):
+        camera_layers = None
+    if camera_layers is not None:
+        camera_layers = [int(x) for x in camera_layers]
+
+    # Parse person and action filters
+    person_filter = getattr(cfg.infer, "person_filter", None)
+    if person_filter is not None and not isinstance(person_filter, str):
+        person_filter = None
+    if person_filter is not None and person_filter.strip() == "":
+        person_filter = None
+
+    action_filter = getattr(cfg.infer, "action_filter", None)
+    if action_filter is not None and not isinstance(action_filter, str):
+        action_filter = None
+    if action_filter is not None and action_filter.strip() == "":
+        action_filter = None
+
     gpu_ids = normalize_gpu_ids(cfg.infer.gpu)
     workers_per_gpu = int(cfg.infer.workers_per_gpu)
     workers_per_gpu = max(workers_per_gpu, 1)
@@ -223,7 +258,9 @@ def main(cfg: DictConfig) -> None:
         logger.error("No worker created. Check infer.gpu / infer.workers_per_gpu")
         return
 
-    action_dirs_all = collect_action_dirs(source_root)
+    action_dirs_all = collect_action_dirs(
+        source_root, camera_layers, person_filter, action_filter
+    )
     if not action_dirs_all:
         logger.error("No action dirs found in: %s", source_root)
         return
@@ -252,6 +289,9 @@ def main(cfg: DictConfig) -> None:
     with shard_log_file.open("w", encoding="utf-8") as f:
         f.write(f"shard_index={shard_index}\n")
         f.write(f"shard_count={shard_count}\n")
+        f.write(f"camera_layers={camera_layers}\n")
+        f.write(f"person_filter={person_filter}\n")
+        f.write(f"action_filter={action_filter}\n")
         f.write(f"total_actions_all={len(action_dirs_all)}\n")
         f.write(f"actions_in_shard={len(action_dirs)}\n")
         f.write("actions:\n")
@@ -259,12 +299,26 @@ def main(cfg: DictConfig) -> None:
             rel_action = action_dir.relative_to(source_root)
             f.write(f"{rel_action.as_posix()}\n")
 
-    logger.info("Shard action list saved: %s", shard_log_file)
+    filter_info_parts = []
+    if camera_layers:
+        filter_info_parts.append(f"layers={camera_layers}")
+    if person_filter:
+        filter_info_parts.append(f"person={person_filter}")
+    if action_filter:
+        filter_info_parts.append(f"action={action_filter}")
+    filter_info = ", ".join(filter_info_parts) if filter_info_parts else "no_filters"
+    logger.info("Shard action list saved [%s]: %s", filter_info, shard_log_file)
 
     chunks = split_evenly(action_dirs, total_workers)
 
     logger.info("Source data root: %s", source_root)
     logger.info("Result root: %s", result_root)
+    if camera_layers:
+        logger.info("Camera layer filter: %s", camera_layers)
+    if person_filter:
+        logger.info("Person filter: %s", person_filter)
+    if action_filter:
+        logger.info("Action filter: %s", action_filter)
     logger.info("GPU ids: %s, workers_per_gpu=%d", gpu_ids, workers_per_gpu)
     logger.info(
         "Shard: index=%d/%d, actions_in_shard=%d, total_actions=%d",
@@ -309,6 +363,7 @@ def main(cfg: DictConfig) -> None:
                 action_log_root,
                 cfg_dict,
                 i,
+                camera_layers,
             ),
         )
         process.start()
