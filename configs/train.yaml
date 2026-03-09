@@ -5,11 +5,6 @@ hydra:
   sweep:
     dir: logs/
     subdir: ${experiment}/${now:%Y-%m-%d}/${now:%H-%M-%S}
-  sweeper:
-    params:
-      model.fuse_method: pose_atn
-      model.fusion_layers: 0, 1, 2, 3, 4, 5
-      model.backbone: 3dcnn
 
 loss:
   lr: 0.0001
@@ -17,26 +12,31 @@ loss:
   beta2: 0.999 # decapture
 
 data:
-  root_path: /workspace/data/dual_view_pose
+  root_path: /workspace/data/skiing_unity_dataset
 
-  # TODO：这里还有改进的空间
+  cross_validation:
+    # 生成 index mapping 的配置（用于 cross_validation/generate_cv_index.py）
+    num_persons: 2
+    num_actions: 12
+    num_cameras: 108
+    strategies: [by_person, by_action]
+    n_splits: 5
+    force_recreate: false
+
   raw:
     video_path: ${data.root_path}/raw_data # 暂时不使用kpt
     sam_3d_body_results_path: ${data.root_path}/sam3d_body_results/person # 没有标签的训练数据
   unity:
-    video_path: ${data.root_path}/unity_data/Recordings/male # 暂时不使用kpt
-    label_path: ${data.root_path}/unity_data/RecordingsPose # 有标签的训练数据
-    sam_3d_body_results_path: ${data.root_path}/sam3d_body_results/unity # 有标签的训练数据
+    data_path: ${data.root_path}/data
+    sam_3d_body_results_path: ${data.root_path}/sam3d_body_results/inference # 有标签的训练数据
 
-  index_mapping: ${data.root_path}/index_mapping # training mapping path, this used for cross validation, with different class number.
-  
+  index_mapping: ${data.root_path}/index_mapping/camera_pairs_by_action.json # training mapping path, this used for cross validation, with different class number.
+
   num_workers: 12
   img_size: 224
 
   batch_size: 1 # load video number
   video_batch_size: 32
-
-  fold: 5 # the fold number of the cross validation
 
 model:
   backbone: 3dcnn # choices=[3dcnn, 2dcnn, cnn_lstm, two_stream], help='the backbone of the model'
@@ -49,10 +49,6 @@ model:
 train:
   # Training config
   max_epochs: 50 # numer of epochs of training
-
-  # used for val
-  clip_duration: 1 # clip duration for the video
-  uniform_temporal_subsample_num: 8 # num frame from the clip duration, f or define one gait cycle, we need use whole frames.
 
   view: multi # single or multi
 

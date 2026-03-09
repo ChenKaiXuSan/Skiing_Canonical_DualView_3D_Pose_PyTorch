@@ -162,7 +162,7 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
 @hydra.main(
     version_base=None,
     config_path="../configs",  # * the config_path is relative to location of the python script
-    config_name="config.yaml",
+    config_name="train.yaml",
 )
 def init_params(config):
     #######################

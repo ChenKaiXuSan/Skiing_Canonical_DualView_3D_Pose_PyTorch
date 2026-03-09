@@ -20,5 +20,15 @@
 			"name": "MultiView_DriverAction_PyTorch",
 			"path": "/workspace/MultiView_DriverAction_PyTorch"
 		}
-	]
+	],
+	"settings": {
+		"python-envs.pythonProjects": [
+			{
+				"path": "skiing_unity_dataset",
+				"envManager": "ms-python.python:venv",
+				"packageManager": "ms-python.python:pip",
+				"workspace": "data"
+			}
+		]
+	}
 }

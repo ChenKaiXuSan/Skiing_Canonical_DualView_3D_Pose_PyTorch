@@ -28,6 +28,8 @@ from typing import List, Dict
 
 logger = logging.getLogger(__name__)
 
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
+
 
 def load_data(input_video_path: Dict[str, Path]) -> Dict[str, List[np.ndarray]]:
     """
@@ -78,7 +80,7 @@ def load_capture_frames(capture_dir: Path) -> List[np.ndarray]:
         [
             p
             for p in capture_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}
+            if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
         ]
     )
 
@@ -93,17 +95,47 @@ def load_capture_frames(capture_dir: Path) -> List[np.ndarray]:
     return frames
 
 
-def collect_action_dirs(source_root: Path) -> List[Path]:
-    """Collect all action directories that contain a ``frames`` subdirectory.
+def _has_image_files(folder: Path) -> bool:
+    """Check whether a folder directly contains image files."""
+    for p in folder.iterdir():
+        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES:
+            return True
+    return False
 
-    This keeps worker partitioning at action granularity regardless of the
-    dataset hierarchy (e.g., gender/action or person/action).
+
+def collect_capture_dirs(action_dir: Path) -> List[Path]:
+    """Collect camera folders under one action directory.
+
+    Supported layout:
+    - person/action/frames/camera
     """
-    action_dirs = sorted(
-        [
-            p.parent
-            for p in source_root.rglob("frames")
-            if p.is_dir() and p.parent.is_dir()
-        ]
+    frames_dir = action_dir / "frames"
+    if not frames_dir.is_dir():
+        return []
+
+    capture_dirs = sorted(
+        [x for x in frames_dir.iterdir() if x.is_dir() and _has_image_files(x)]
     )
+    return capture_dirs
+
+
+def collect_action_dirs(source_root: Path) -> List[Path]:
+    """Collect action directories for camera-based inference.
+
+    Supported layout:
+    - person/action/frames/camera
+
+    An action directory is identified if it has a ``frames`` folder containing
+    camera subdirectories with image files.
+    """
+    action_dirs_set = set()
+
+    # Strict scan: only one level below each person directory.
+    for person_dir in sorted([x for x in source_root.iterdir() if x.is_dir()]):
+        for candidate in sorted([x for x in person_dir.iterdir() if x.is_dir()]):
+            if collect_capture_dirs(candidate):
+                action_dirs_set.add(candidate)
+
+    # Keep sorted deterministic ordering for sharding.
+    action_dirs = sorted(action_dirs_set)
     return action_dirs
