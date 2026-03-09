@@ -37,7 +37,7 @@ from pytorch_lightning.callbacks import (
     RichModelSummary,
     TQDMProgressBar,
 )
-from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger
 
 from project.dataloader.data_loader import UnityDataModule
 
@@ -48,10 +48,8 @@ from project.dataloader.data_loader import UnityDataModule
 from project.trainer.baseline.train_3dcnn import Res3DCNNTrainer
 from project.trainer.early.train_early_fusion import EarlyFusion3DCNNTrainer
 from project.trainer.late.train_late_fusion import LateFusion3DCNNTrainer
+from project.trainer.train_fusion_SSM import FusionSSMTrainer
 
-# attention based
-from project.trainer.mid.train_pose_attn import PoseAttnTrainer
-from project.trainer.mid.train_se_attn import SEAttnTrainer
 from project.map_config import UnityDataConfig
 
 logger = logging.getLogger(__name__)
@@ -189,12 +187,21 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
 
     # * select experiment
     # TODO: add more experiment trainer here.
+    monitor_metric = "val/video_acc"
+    monitor_mode = "max"
+    ckpt_filename = "{epoch}-{val/loss:.2f}-{val/video_acc:.4f}"
+
     if hparams.train.view == "multi":
         if hparams.model.backbone == "3dcnn":
             if hparams.model.fuse_method in ["add", "mul", "concat", "avg"]:
                 classification_module = EarlyFusion3DCNNTrainer(hparams)
             elif hparams.model.fuse_method == "late":
                 classification_module = LateFusion3DCNNTrainer(hparams)
+            elif hparams.model.fuse_method in ["ssm", "mamba", "mamba_ssm"]:
+                classification_module = FusionSSMTrainer(hparams)
+                monitor_metric = "val/loss"
+                monitor_mode = "min"
+                ckpt_filename = "{epoch}-{val/loss:.4f}"
             else:
                 raise ValueError("the experiment fuse method is not supported.")
         else:
@@ -212,7 +219,7 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
         save_dir=os.path.join(hparams.log_path, "tb_logs"),
         name="fold_" + str(fold),  # here should be str type.
     )
-    
+
     # some callbacks
     progress_bar = TQDMProgressBar(refresh_rate=10)
     rich_model_summary = RichModelSummary(max_depth=2)
@@ -220,19 +227,19 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
     # define the checkpoint becavier.
     model_check_point = ModelCheckpoint(
         dirpath=os.path.join(hparams.log_path, "checkpoints", "fold_" + str(fold)),
-        filename="{epoch}-{val/loss:.2f}-{val/video_acc:.4f}",
+        filename=ckpt_filename,
         auto_insert_metric_name=False,
-        monitor="val/video_acc",
-        mode="max",
+        monitor=monitor_metric,
+        mode=monitor_mode,
         save_last=True,
         save_top_k=2,
     )
 
     # define the early stop.
     early_stopping = EarlyStopping(
-        monitor="val/video_acc",
+        monitor=monitor_metric,
         patience=5,
-        mode="max",
+        mode=monitor_mode,
     )
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
@@ -253,9 +260,9 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
             lr_monitor,
             DeviceStatsMonitor(),  # monitor the device stats.
         ],
-        # limit_train_batches=2,
-        # limit_val_batches=2,
-        # limit_test_batches=2,
+        limit_train_batches=2,
+        limit_val_batches=2,
+        limit_test_batches=2,
     )
 
     trainer.fit(classification_module, data_module)
