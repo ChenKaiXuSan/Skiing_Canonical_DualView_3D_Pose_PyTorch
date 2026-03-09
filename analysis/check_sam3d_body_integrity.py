@@ -21,6 +21,11 @@ from typing import Dict, List, Sequence, Tuple
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
 NPZ_PATTERN = re.compile(r"^(\d+)_sam3d_body\.npz$")
+CAMERA_PATTERN = re.compile(r"^capture_L(\d+)_A(\d{3})$")
+EXPECTED_LEVELS = set(range(5))
+EXPECTED_ANGLES = set(range(0, 360, 10))
+DEFAULT_SOURCE_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/data")
+DEFAULT_RESULT_ROOT = Path("/work/SSR/share/data/skiing/skiing_unity_dataset/sam3d_body_results")
 
 
 @dataclass
@@ -40,7 +45,20 @@ class CaptureCheck:
 class IntegritySummary:
     source_root: str
     result_root: str
+    total_persons: int
+    unique_action_names: int
     total_actions: int
+    camera_level_depth: int
+    unique_cameras: int
+    total_cameras: int
+    detected_camera_levels: List[int]
+    detected_angles: List[int]
+    captures_with_bad_camera_name: int
+    actions_with_missing_levels: int
+    actions_with_missing_angles: int
+    actions_with_wrong_camera_count: int
+    actions_with_camera_config_issues: int
+    camera_config_passed: bool
     total_captures: int
     total_source_frames: int
     total_output_npz: int
@@ -112,14 +130,50 @@ def parse_output_indices(output_dir: Path) -> Tuple[List[int], List[str], List[s
 
 def check_integrity(source_root: Path, result_root: Path) -> Tuple[IntegritySummary, List[CaptureCheck]]:
     action_dirs = split_action_dirs(source_root)
+    person_names = {
+        action_dir.relative_to(source_root).parts[0]
+        for action_dir in action_dirs
+        if len(action_dir.relative_to(source_root).parts) >= 1
+    }
+    action_names = {
+        action_dir.name
+        for action_dir in action_dirs
+    }
 
     checks: List[CaptureCheck] = []
     total_source_frames = 0
     total_output_npz = 0
+    capture_name_set = set()
+    capture_depths: List[int] = []
+    detected_levels: set[int] = set()
+    detected_angles: set[int] = set()
+    bad_camera_name_count = 0
+    action_to_camera_pairs: Dict[str, set[Tuple[int, int]]] = {}
+    action_to_bad_names: Dict[str, int] = {}
 
     for action_dir in action_dirs:
+        action_rel = action_dir.relative_to(source_root).as_posix()
+        action_to_camera_pairs[action_rel] = set()
+        action_to_bad_names[action_rel] = 0
+
         for capture_dir in list_capture_dirs(action_dir):
             rel_capture = capture_dir.relative_to(source_root)
+            rel_from_frames = capture_dir.relative_to(action_dir / "frames")
+            capture_depths.append(len(rel_from_frames.parts))
+            if rel_from_frames.parts:
+                camera_name = rel_from_frames.parts[-1]
+                capture_name_set.add(camera_name)
+                m_cam = CAMERA_PATTERN.match(camera_name)
+                if m_cam:
+                    level = int(m_cam.group(1))
+                    angle = int(m_cam.group(2))
+                    detected_levels.add(level)
+                    detected_angles.add(angle)
+                    action_to_camera_pairs[action_rel].add((level, angle))
+                else:
+                    bad_camera_name_count += 1
+                    action_to_bad_names[action_rel] += 1
+
             source_images = list_source_images(capture_dir)
             n_src = len(source_images)
             total_source_frames += n_src
@@ -151,10 +205,55 @@ def check_integrity(source_root: Path, result_root: Path) -> Tuple[IntegritySumm
                 )
             )
 
+    expected_pairs = {(l, a) for l in EXPECTED_LEVELS for a in EXPECTED_ANGLES}
+    actions_with_missing_levels = 0
+    actions_with_missing_angles = 0
+    actions_with_wrong_camera_count = 0
+    actions_with_camera_config_issues = 0
+
+    for action_rel, pairs in action_to_camera_pairs.items():
+        levels = {l for l, _ in pairs}
+        angles = {a for _, a in pairs}
+        bad_names = action_to_bad_names[action_rel]
+
+        missing_levels = EXPECTED_LEVELS - levels
+        missing_angles = EXPECTED_ANGLES - angles
+        wrong_count = len(pairs) != len(expected_pairs)
+
+        if missing_levels:
+            actions_with_missing_levels += 1
+        if missing_angles:
+            actions_with_missing_angles += 1
+        if wrong_count:
+            actions_with_wrong_camera_count += 1
+
+        if bad_names > 0 or missing_levels or missing_angles or wrong_count:
+            actions_with_camera_config_issues += 1
+
+    camera_config_passed = (
+        bad_camera_name_count == 0
+        and actions_with_missing_levels == 0
+        and actions_with_missing_angles == 0
+        and actions_with_wrong_camera_count == 0
+    )
+
     summary = IntegritySummary(
         source_root=str(source_root),
         result_root=str(result_root),
+        total_persons=len(person_names),
+        unique_action_names=len(action_names),
         total_actions=len(action_dirs),
+        camera_level_depth=max(capture_depths) if capture_depths else 0,
+        unique_cameras=len(capture_name_set),
+        total_cameras=len(checks),
+        detected_camera_levels=sorted(detected_levels),
+        detected_angles=sorted(detected_angles),
+        captures_with_bad_camera_name=bad_camera_name_count,
+        actions_with_missing_levels=actions_with_missing_levels,
+        actions_with_missing_angles=actions_with_missing_angles,
+        actions_with_wrong_camera_count=actions_with_wrong_camera_count,
+        actions_with_camera_config_issues=actions_with_camera_config_issues,
+        camera_config_passed=camera_config_passed,
         total_captures=len(checks),
         total_source_frames=total_source_frames,
         total_output_npz=total_output_npz,
@@ -174,7 +273,22 @@ def print_report(summary: IntegritySummary, checks: Sequence[CaptureCheck], show
     print("=== SAM3D-Body Integrity Report ===")
     print(f"source_root: {summary.source_root}")
     print(f"result_root: {summary.result_root}")
+    print(f"persons: {summary.total_persons}")
+    print(f"unique action names: {summary.unique_action_names}")
     print(f"actions: {summary.total_actions}")
+    print(f"camera level depth: {summary.camera_level_depth}")
+    print(f"unique cameras: {summary.unique_cameras}")
+    print(f"total cameras: {summary.total_cameras}")
+    print(f"detected camera levels: {summary.detected_camera_levels}")
+    print(
+        f"detected angle range: {summary.detected_angles[:1]} ... {summary.detected_angles[-1:] if summary.detected_angles else []} (count={len(summary.detected_angles)})"
+    )
+    print(f"captures with bad camera name: {summary.captures_with_bad_camera_name}")
+    print(f"actions with missing levels: {summary.actions_with_missing_levels}")
+    print(f"actions with missing angles: {summary.actions_with_missing_angles}")
+    print(f"actions with wrong camera count: {summary.actions_with_wrong_camera_count}")
+    print(f"actions with camera config issues: {summary.actions_with_camera_config_issues}")
+    print(f"camera config passed (5 levels x 10deg): {summary.camera_config_passed}")
     print(f"captures: {summary.total_captures}")
     print(f"source frames: {summary.total_source_frames}")
     print(f"output npz: {summary.total_output_npz}")
@@ -218,8 +332,18 @@ def print_report(summary: IntegritySummary, checks: Sequence[CaptureCheck], show
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check SAM3D-Body inference integrity")
-    parser.add_argument("--source-root", type=Path, required=True, help="Dataset data root")
-    parser.add_argument("--result-root", type=Path, required=True, help="SAM3D result root")
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=DEFAULT_SOURCE_ROOT,
+        help=f"Dataset data root (default: {DEFAULT_SOURCE_ROOT})",
+    )
+    parser.add_argument(
+        "--result-root",
+        type=Path,
+        default=DEFAULT_RESULT_ROOT,
+        help=f"SAM3D result root (default: {DEFAULT_RESULT_ROOT})",
+    )
     parser.add_argument(
         "--report-json",
         type=Path,
