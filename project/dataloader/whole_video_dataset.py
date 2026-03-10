@@ -221,6 +221,14 @@ class LabeledUnityDataset(Dataset):
             return cam_str.split("_")[-1]
         return cam_str
 
+    @staticmethod
+    def _extract_cam_layer_token(cam_id: Any) -> str:
+        """Extract layer/group token from camera id (e.g. L2_A001 -> L2)."""
+        cam_str = str(cam_id)
+        if "_" in cam_str:
+            return cam_str.split("_")[1]
+        return ""
+
     def _validate_stereo_pair_consistency(
         self,
         item: Dict[str, Any],
@@ -285,9 +293,12 @@ class LabeledUnityDataset(Dataset):
 
         cam1_ide = self._extract_cam_ide_token(cam1_id)
         cam2_ide = self._extract_cam_ide_token(cam2_id)
-        if cam1_ide == cam2_ide:
+        cam1_layer = self._extract_cam_layer_token(cam1_id)
+        cam2_layer = self._extract_cam_layer_token(cam2_id)
+        if cam1_ide == cam2_ide and cam1_layer == cam2_layer:
             raise ValueError(
-                f"Invalid camera pair: IDE token should differ, got {cam1_id} ({cam1_ide}) vs {cam2_id} ({cam2_ide})"
+                "Invalid camera pair: same layer and IDE token are not allowed, got "
+                f"{cam1_id} ({cam1_layer}, {cam1_ide}) vs {cam2_id} ({cam2_layer}, {cam2_ide})"
             )
 
     def _load_pair_modalities(self, item: Dict[str, Any]) -> Dict[str, Any]:

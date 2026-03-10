@@ -64,25 +64,6 @@ class FusionSSMTrainer(LightningModule):
         self.test_outputs: List[Dict[str, Any]] = []
         self.test_save_dir: Path = Path(self.save_root) / "pose_analysis"
 
-    def _resolve_run_log_dir(self) -> Path:
-        """Resolve active run log directory.
-
-        Priority:
-          1) Lightning logger log_dir
-          2) Lightning logger root_dir
-          3) hparams log_path fallback
-        """
-        if self.logger is not None:
-            log_dir = getattr(self.logger, "log_dir", None)
-            if isinstance(log_dir, str) and len(log_dir) > 0:
-                return Path(log_dir)
-
-            root_dir = getattr(self.logger, "root_dir", None)
-            if isinstance(root_dir, str) and len(root_dir) > 0:
-                return Path(root_dir)
-
-        return Path(self.save_root)
-
     @staticmethod
     def _require_pose(batch: Dict[str, Any], path: Sequence[str]) -> torch.Tensor:
         cur: Any = batch
@@ -179,7 +160,6 @@ class FusionSSMTrainer(LightningModule):
 
     def on_test_start(self) -> None:
         self.test_outputs: List[Dict[str, Any]] = []
-        self.test_save_dir = self._resolve_run_log_dir() / "pose_analysis"
         self.test_save_dir.mkdir(parents=True, exist_ok=True)
         logger.info("FusionSSM test start")
 
@@ -199,7 +179,13 @@ class FusionSSMTrainer(LightningModule):
             p_gt = batch["kpt3d_gt"].float()
             loss_dict = self.loss_fn(p_hat=p_hat, p_gt=p_gt, logvar=logvar)
             mpjpe = torch.norm(p_hat - p_gt, dim=-1).mean()
-            self.log("test/mpjpe", mpjpe, on_step=False, on_epoch=True, batch_size=p_hat.shape[0])
+            self.log(
+                "test/mpjpe",
+                mpjpe,
+                on_step=False,
+                on_epoch=True,
+                batch_size=p_hat.shape[0],
+            )
         else:
             p_gt = None
             loss_dict = self.loss_fn(
@@ -210,9 +196,23 @@ class FusionSSMTrainer(LightningModule):
             )
 
         loss = loss_dict["loss"]
-        self.log("test/loss", loss, on_step=False, on_epoch=True, batch_size=p_hat.shape[0])
-        self.log("test/alpha_mean", alpha.mean(), on_step=False, on_epoch=True, batch_size=p_hat.shape[0])
-        self.log("test/alpha_std", alpha.std(), on_step=False, on_epoch=True, batch_size=p_hat.shape[0])
+        self.log(
+            "test/loss", loss, on_step=False, on_epoch=True, batch_size=p_hat.shape[0]
+        )
+        self.log(
+            "test/alpha_mean",
+            alpha.mean(),
+            on_step=False,
+            on_epoch=True,
+            batch_size=p_hat.shape[0],
+        )
+        self.log(
+            "test/alpha_std",
+            alpha.std(),
+            on_step=False,
+            on_epoch=True,
+            batch_size=p_hat.shape[0],
+        )
 
         pack: Dict[str, Any] = {
             "p_hat": p_hat.detach().cpu(),
@@ -253,7 +253,9 @@ class FusionSSMTrainer(LightningModule):
         if all("label" in x for x in self.test_outputs):
             payload["label"] = torch.cat([x["label"] for x in self.test_outputs], dim=0)
         if all("logvar" in x for x in self.test_outputs):
-            payload["logvar"] = torch.cat([x["logvar"] for x in self.test_outputs], dim=0)
+            payload["logvar"] = torch.cat(
+                [x["logvar"] for x in self.test_outputs], dim=0
+            )
         if any("meta" in x for x in self.test_outputs):
             payload["meta"] = [x.get("meta", None) for x in self.test_outputs]
 

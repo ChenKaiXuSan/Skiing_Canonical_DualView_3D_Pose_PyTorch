@@ -33,11 +33,10 @@ data:
   index_mapping: ${data.root_path}/index_mapping # precomputed index mapping directory
   index_mapping_file: camera_pairs_by_action.json # precomputed index mapping json file name
 
-  num_workers: 12
+  num_workers: 16
   img_size: 224
 
-  batch_size: 1 # load video number
-  video_batch_size: 32
+  batch_size: 4 # load video number
 
 model:
   backbone: 3dcnn # choices=[3dcnn, 2dcnn, cnn_lstm, two_stream], help='the backbone of the model'
