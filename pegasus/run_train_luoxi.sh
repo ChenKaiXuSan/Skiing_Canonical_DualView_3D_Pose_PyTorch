@@ -14,7 +14,7 @@ mkdir -p logs/pegasus/
 
 source ${CONDA_PREFIX}/etc/profile.d/conda.sh
 conda deactivate
-conda activate /home/SSR/luoxi/miniconda3/envs/sam_3d_body
+conda activate /home/SSR/luoxi/miniconda3/envs/multiview-video-cls
 
 conda env list
 
@@ -31,6 +31,7 @@ NUM_WORKERS=16
 MODEL_BACKBONE="3dcnn"
 FUSE_METHOD="mamba_ssm"
 TRAIN_VIEW="multi"
+BATCH_SIZE=16
 
 echo "🏁 Train job started at: $(date)"
 echo "Project Root: ${PROJECT_ROOT}"
@@ -47,8 +48,10 @@ python -m project.main \
     train.gpu=${GPU_ID} \
     train.max_epochs=${MAX_EPOCHS} \
     data.num_workers=${NUM_WORKERS} \
+    data.batch_size=${BATCH_SIZE} \
     train.view=${TRAIN_VIEW} \
     model.backbone=${MODEL_BACKBONE} \
     model.fuse_method=${FUSE_METHOD}
+
 
 echo "🏁 Train job finished at: $(date)"
