@@ -30,7 +30,6 @@ import hydra
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import (
-    DeviceStatsMonitor,
     EarlyStopping,
     LearningRateMonitor,
     ModelCheckpoint,
@@ -258,11 +257,11 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
             model_check_point,
             early_stopping,
             lr_monitor,
-            DeviceStatsMonitor(),  # monitor the device stats.
+            # DeviceStatsMonitor(),  # monitor the device stats.
         ],
-        limit_train_batches=2,
-        limit_val_batches=2,
-        limit_test_batches=2,
+        limit_train_batches=5,
+        limit_val_batches=5,
+        limit_test_batches=5,
     )
 
     trainer.fit(classification_module, data_module)
@@ -282,10 +281,31 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
 )
 def init_params(config):
     # Load precomputed fold mapping only; do not prepare CV splits here.
-    fold_dataset_idx = load_fold_dataset_idx_from_index_mapping(config)
+    fold_dataset_idx: Dict[int, Dict[str, List[UnityDataConfig]]] = (
+        load_fold_dataset_idx_from_index_mapping(config)
+    )
+
+    requested_fold = int(config.train.fold)
+    available_folds = sorted(fold_dataset_idx.keys())
+
+    # train.fold >= 0: run only the specified fold (recommended for multi-node jobs)
+    # train.fold < 0: run all folds sequentially (backward compatible mode)
+    if requested_fold >= 0:
+        if requested_fold not in fold_dataset_idx:
+            raise KeyError(
+                f"Requested fold {requested_fold} is not in index mapping. "
+                f"Available folds: {available_folds}"
+            )
+        target_folds = [requested_fold]
+    else:
+        target_folds = available_folds
 
     logger.info("#" * 50)
-    logger.info("Start train all fold")
+    logger.info(
+        "Start training folds: %s (requested train.fold=%s)",
+        target_folds,
+        requested_fold,
+    )
     logger.info("#" * 50)
 
     #########
@@ -293,7 +313,8 @@ def init_params(config):
     #########
     # * for one fold, we first train/val model, then save the best ckpt preds/label into .pt file.
 
-    for fold, dataset_value in fold_dataset_idx.items():
+    for fold in target_folds:
+        dataset_value = fold_dataset_idx[fold]
         logger.info("#" * 50)
         logger.info(f"Start train fold: {fold}")
         logger.info("#" * 50)
@@ -305,7 +326,7 @@ def init_params(config):
         logger.info("#" * 50)
 
     logger.info("#" * 50)
-    logger.info("finish train all fold")
+    logger.info("finish train folds: %s", target_folds)
     logger.info("#" * 50)
 
 

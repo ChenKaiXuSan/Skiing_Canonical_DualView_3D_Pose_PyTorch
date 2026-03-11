@@ -36,7 +36,7 @@ data:
   num_workers: 16
   img_size: 224
 
-  batch_size: 4 # load video number
+  batch_size: 16
 
 model:
   backbone: 3dcnn # choices=[3dcnn, 2dcnn, cnn_lstm, two_stream], help='the backbone of the model'
@@ -53,6 +53,7 @@ train:
   view: multi # single or multi
 
   gpu: 0 # choices=[0, 1], help='the gpu number whicht to train'
+  fold: 0 # the fold number for cross validation
 
-log_path: logs/train/${experiment}/${now:%Y-%m-%d}/${now:%H-%M-%S}
-experiment: view_${train.view}_${model.backbone}_fuse_method_${model.fuse_method}_${model.ablation_study}_${model.fusion_layers} # the experiment name, used for log path
+experiment: ${model.backbone}_fuse_method_${model.fuse_method}_fold_${train.fold} # the experiment name, used for log path
+log_path: logs/train/${experiment}/${now:%Y-%m-%d}
