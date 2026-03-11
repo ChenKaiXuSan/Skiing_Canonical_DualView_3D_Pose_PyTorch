@@ -3,9 +3,9 @@
 #PBS -q gpu
 #PBS -l elapstim_req=24:00:00
 #PBS -N fusion_SSM_train
-#PBS -J 0-4
-#PBS -o logs/pegasus/train_${PBS_JOBID}_${PBS_ARRAY_INDEX}.log
-#PBS -e logs/pegasus/train_${PBS_JOBID}_${PBS_ARRAY_INDEX}_err.log
+#PBS -t 0-4
+#PBS -o logs/pegasus/train_${PBS_SUBREQNO}.log
+#PBS -e logs/pegasus/train_${PBS_SUBREQNO}_err.log
 
 # === 1. 環境準備 ===
 PROJECT_ROOT="/work/SSR/share/code/Skiing_Canonical_DualView_3D_Pose_PyTorch"
@@ -35,7 +35,7 @@ BATCH_SIZE=16
 # fold assignment:
 # - PBS array mode: use PBS_ARRAY_INDEX
 # - non-array/manual mode: allow env FOLD_ID override, default 0
-FOLD_ID=${PBS_ARRAY_INDEX:-${FOLD_ID:-0}}
+FOLD_ID=${PBS_SUBREQNO:-${FOLD_ID:-0}}
 
 echo "🏁 Train job started at: $(date)"
 echo "Project Root: ${PROJECT_ROOT}"
