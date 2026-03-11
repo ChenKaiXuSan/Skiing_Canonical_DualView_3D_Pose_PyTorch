@@ -55,5 +55,5 @@ train:
   gpu: 0 # choices=[0, 1], help='the gpu number whicht to train'
   fold: 0 # the fold number for cross validation
 
-experiment: ${model.backbone}_fuse_method_${model.fuse_method}_fold_${train.fold} # the experiment name, used for log path
-log_path: logs/train/${experiment}/${now:%Y-%m-%d}
+experiment: ${model.backbone}_fuse_method_${model.fuse_method} # the experiment name, used for log path
+log_path: logs/train/${experiment}/${now:%Y-%m-%d}/fold_${train.fold}

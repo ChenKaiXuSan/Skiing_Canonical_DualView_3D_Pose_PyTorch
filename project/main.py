@@ -257,11 +257,10 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
             model_check_point,
             early_stopping,
             lr_monitor,
-            # DeviceStatsMonitor(),  # monitor the device stats.
         ],
-        limit_train_batches=5,
-        limit_val_batches=5,
-        limit_test_batches=5,
+        limit_train_batches=10,
+        limit_val_batches=10,
+        limit_test_batches=10,
     )
 
     trainer.fit(classification_module, data_module)
