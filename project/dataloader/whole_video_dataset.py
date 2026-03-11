@@ -203,6 +203,145 @@ class LabeledUnityDataset(Dataset):
         )
 
     @staticmethod
+    def _is_empty_keypoint_array(arr: np.ndarray) -> bool:
+        """Return True when keypoint array has no valid joint entries."""
+        kpt = np.asarray(arr)
+        if kpt.size == 0:
+            return True
+        if kpt.ndim == 3 and kpt.shape[0] == 1:
+            kpt = kpt[0]
+        if kpt.ndim < 2:
+            return True
+        return int(kpt.shape[0]) == 0
+
+    @staticmethod
+    def _pick_fallback_frame_index(target_idx: int, valid_indices: List[int]) -> Optional[int]:
+        """Pick fallback index: prefer nearest previous, otherwise nearest next."""
+        if not valid_indices:
+            return None
+
+        prev = [x for x in valid_indices if x < target_idx]
+        if prev:
+            return prev[-1]
+
+        nxt = [x for x in valid_indices if x > target_idx]
+        if nxt:
+            return nxt[0]
+
+        return None
+
+    @staticmethod
+    def _read_none_detected_indices(output_dir: Path) -> Tuple[bool, List[int], List[str]]:
+        """Read none_detected_frames.txt under one SAM output directory.
+
+        Returns:
+            (exists, sorted unique indices, invalid_lines)
+        """
+        none_file = output_dir / "none_detected_frames.txt"
+        if not none_file.exists() or not none_file.is_file():
+            return False, [], []
+
+        indices: List[int] = []
+        invalid_lines: List[str] = []
+        for raw in none_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                idx = int(line)
+            except ValueError:
+                invalid_lines.append(line)
+                continue
+            if idx < 0:
+                invalid_lines.append(line)
+                continue
+            indices.append(idx)
+
+        return True, sorted(set(indices)), invalid_lines
+
+    def _resolve_sam_sequence_with_fallback(
+        self,
+        frame_indices: List[int],
+        sam_file_map: Dict[int, Path],
+        camera_id: Any,
+        none_detected_indices: Optional[set[int]] = None,
+    ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        """Resolve SAM2D/SAM3D per frame index, filling empty entries from nearby frames."""
+        loaded: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        valid_indices: List[int] = []
+        none_detected = none_detected_indices or set()
+
+        for idx in frame_indices:
+            if idx not in sam_file_map:
+                if idx in none_detected:
+                    continue
+                logger.warning(
+                    "Missing SAM file at frame idx=%s for camera %s; will try nearby-frame fallback",
+                    idx,
+                    camera_id,
+                )
+                continue
+
+            sam2d, sam3d = self._load_sam3d_file(sam_file_map[idx])
+            loaded[idx] = (sam2d, sam3d)
+            if not self._is_empty_keypoint_array(sam2d) and not self._is_empty_keypoint_array(sam3d):
+                valid_indices.append(idx)
+
+        if not valid_indices:
+            raise RuntimeError(
+                f"All SAM keypoint results are empty for camera {camera_id}. "
+                "Cannot apply nearby-frame fallback."
+            )
+
+        resolved: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        for idx in frame_indices:
+            if idx in loaded:
+                sam2d, sam3d = loaded[idx]
+            else:
+                sam2d, sam3d = np.empty((0, 0), dtype=np.float32), np.empty((0, 0), dtype=np.float32)
+
+            if idx in loaded and not self._is_empty_keypoint_array(sam2d) and not self._is_empty_keypoint_array(sam3d):
+                resolved[idx] = (sam2d, sam3d)
+                continue
+
+            fallback_idx = self._pick_fallback_frame_index(idx, valid_indices)
+            if fallback_idx is None:
+                raise RuntimeError(
+                    f"SAM keypoint result at idx={idx} for camera {camera_id} is empty, "
+                    "and no fallback frame exists."
+                )
+
+            logger.warning(
+                "SAM result empty at frame idx=%s for camera %s; using fallback idx=%s",
+                idx,
+                camera_id,
+                fallback_idx,
+            )
+            resolved[idx] = loaded[fallback_idx]
+
+        return resolved
+
+    @staticmethod
+    def _log_missing_sam_paths(
+        camera_id: Any,
+        sam_dir: Path,
+        missing_indices: List[int],
+    ) -> None:
+        """Log all expected SAM file paths for missing frame indices."""
+        if not missing_indices:
+            return
+
+        expected_paths = [
+            str((sam_dir / f"{idx:06d}_sam3d_body.npz").resolve()) for idx in missing_indices
+        ]
+        logger.warning(
+            "Missing SAM files for camera %s (count=%s). Full expected paths:\n%s",
+            camera_id,
+            len(missing_indices),
+            "\n".join(expected_paths),
+        )
+
+    @staticmethod
     def _temporal_resample_indices(src_len: int, dst_len: int) -> torch.Tensor:
         if src_len <= 0:
             raise ValueError("src_len must be > 0")
@@ -326,21 +465,64 @@ class LabeledUnityDataset(Dataset):
         sam3d_cam1_map = self._build_idx_file_map(sam3d_cam1_dir, "*_sam3d_body.npz")
         sam3d_cam2_map = self._build_idx_file_map(sam3d_cam2_dir, "*_sam3d_body.npz")
 
+        cam1_none_exists, cam1_none_idx, cam1_none_invalid = self._read_none_detected_indices(
+            sam3d_cam1_dir
+        )
+        cam2_none_exists, cam2_none_idx, cam2_none_invalid = self._read_none_detected_indices(
+            sam3d_cam2_dir
+        )
+        if cam1_none_exists and cam1_none_invalid:
+            logger.warning(
+                "Invalid lines in none_detected_frames.txt for camera %s: %s",
+                item.get("cam1_id", "unknown"),
+                cam1_none_invalid[:5],
+            )
+        if cam2_none_exists and cam2_none_invalid:
+            logger.warning(
+                "Invalid lines in none_detected_frames.txt for camera %s: %s",
+                item.get("cam2_id", "unknown"),
+                cam2_none_invalid[:5],
+            )
+
         common_idx = sorted(
             set(cam1_frames_map)
             & set(cam2_frames_map)
             & set(cam1_kpt2d_map)
             & set(cam2_kpt2d_map)
             & set(kpt3d_map)
-            & set(sam3d_cam1_map)
-            & set(sam3d_cam2_map)
         )
         if not common_idx:
             raise RuntimeError(
-                "No common frame indices across frame/2d/3d/sam3d modalities for sample: "
+                "No common frame indices across frame/2d/3d modalities for sample: "
                 f"{item.get('person_id', 'unknown')} / {item.get('action_id', 'unknown')} / "
                 f"{item.get('cam1_id', 'unknown')} - {item.get('cam2_id', 'unknown')}"
             )
+
+        cam1_missing_idx = sorted(i for i in common_idx if i not in sam3d_cam1_map)
+        cam2_missing_idx = sorted(i for i in common_idx if i not in sam3d_cam2_map)
+        self._log_missing_sam_paths(
+            camera_id=item.get("cam1_id", "unknown"),
+            sam_dir=sam3d_cam1_dir,
+            missing_indices=cam1_missing_idx,
+        )
+        self._log_missing_sam_paths(
+            camera_id=item.get("cam2_id", "unknown"),
+            sam_dir=sam3d_cam2_dir,
+            missing_indices=cam2_missing_idx,
+        )
+
+        sam_cam1_resolved = self._resolve_sam_sequence_with_fallback(
+            frame_indices=common_idx,
+            sam_file_map=sam3d_cam1_map,
+            camera_id=item.get("cam1_id", "unknown"),
+            none_detected_indices=set(cam1_none_idx),
+        )
+        sam_cam2_resolved = self._resolve_sam_sequence_with_fallback(
+            frame_indices=common_idx,
+            sam_file_map=sam3d_cam2_map,
+            camera_id=item.get("cam2_id", "unknown"),
+            none_detected_indices=set(cam2_none_idx),
+        )
 
         cam1_frames: List[torch.Tensor] = []
         cam2_frames: List[torch.Tensor] = []
@@ -405,8 +587,8 @@ class LabeledUnityDataset(Dataset):
             cam2_kpt2d.append(torch.from_numpy(cam2_kpt2d_np))
             gt_kpt3d.append(torch.from_numpy(gt_kpt3d_np))
 
-            sam1_2d, sam1_3d = self._load_sam3d_file(sam3d_cam1_map[idx])
-            sam2_2d, sam2_3d = self._load_sam3d_file(sam3d_cam2_map[idx])
+            sam1_2d, sam1_3d = sam_cam1_resolved[idx]
+            sam2_2d, sam2_3d = sam_cam2_resolved[idx]
 
             if sam1_2d_sel is None:
                 sam1_2d_sel = self._get_or_build_source_joint_indices(sam1_2d.shape[0])
