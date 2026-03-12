@@ -42,6 +42,13 @@ class UnityDataModule(LightningDataModule):
 
         self._num_workers = opt.data.num_workers
         self._img_size = opt.data.img_size
+        self._load_frames = bool(getattr(opt.data, "load_frames", True))
+        self._load_2d_kpt = bool(getattr(opt.data, "load_2d_kpt", True))
+        self._load_3d_kpt = bool(getattr(opt.data, "load_3d_kpt", True))
+        if not self._load_frames and not self._load_2d_kpt and not self._load_3d_kpt:
+            raise ValueError(
+                "At least one of data.load_frames/data.load_2d_kpt/data.load_3d_kpt must be true."
+            )
 
         # * this is the dataset idx, which include the train/val dataset idx.
         self._dataset_idx = dataset_idx
@@ -80,6 +87,11 @@ class UnityDataModule(LightningDataModule):
         if not batch:
             return {}
 
+        first = batch[0]
+        has_frames = "frames" in first
+        has_2d = "kpt2d_gt" in first and "kpt2d_sam" in first
+        has_3d = "kpt3d_gt" in first and "kpt3d_sam" in first
+
         frames_cam1: List[torch.Tensor] = []
         frames_cam2: List[torch.Tensor] = []
         gt2d_cam1: List[torch.Tensor] = []
@@ -93,39 +105,50 @@ class UnityDataModule(LightningDataModule):
         meta_rows: List[Dict[str, Any]] = []
 
         for sample in batch:
-            frames_cam1.append(
-                self._merge_bt_video(sample["frames"]["cam1"], "frames/cam1")
-            )
-            frames_cam2.append(
-                self._merge_bt_video(sample["frames"]["cam2"], "frames/cam2")
-            )
+            if has_frames:
+                frames_cam1.append(
+                    self._merge_bt_video(sample["frames"]["cam1"], "frames/cam1")
+                )
+                frames_cam2.append(
+                    self._merge_bt_video(sample["frames"]["cam2"], "frames/cam2")
+                )
 
-            gt2d_cam1.append(
-                self._merge_bt_pose(sample["kpt2d_gt"]["cam1"], "kpt2d_gt/cam1")
-            )
-            gt2d_cam2.append(
-                self._merge_bt_pose(sample["kpt2d_gt"]["cam2"], "kpt2d_gt/cam2")
-            )
-            sam2d_cam1.append(
-                self._merge_bt_pose(sample["kpt2d_sam"]["cam1"], "kpt2d_sam/cam1")
-            )
-            sam2d_cam2.append(
-                self._merge_bt_pose(sample["kpt2d_sam"]["cam2"], "kpt2d_sam/cam2")
-            )
-            sam3d_cam1.append(
-                self._merge_bt_pose(sample["kpt3d_sam"]["cam1"], "kpt3d_sam/cam1")
-            )
-            sam3d_cam2.append(
-                self._merge_bt_pose(sample["kpt3d_sam"]["cam2"], "kpt3d_sam/cam2")
-            )
-            gt3d.append(self._merge_bt_pose(sample["kpt3d_gt"], "kpt3d_gt"))
+            if has_2d:
+                gt2d_cam1.append(
+                    self._merge_bt_pose(sample["kpt2d_gt"]["cam1"], "kpt2d_gt/cam1")
+                )
+                gt2d_cam2.append(
+                    self._merge_bt_pose(sample["kpt2d_gt"]["cam2"], "kpt2d_gt/cam2")
+                )
+                sam2d_cam1.append(
+                    self._merge_bt_pose(sample["kpt2d_sam"]["cam1"], "kpt2d_sam/cam1")
+                )
+                sam2d_cam2.append(
+                    self._merge_bt_pose(sample["kpt2d_sam"]["cam2"], "kpt2d_sam/cam2")
+                )
+
+            if has_3d:
+                sam3d_cam1.append(
+                    self._merge_bt_pose(sample["kpt3d_sam"]["cam1"], "kpt3d_sam/cam1")
+                )
+                sam3d_cam2.append(
+                    self._merge_bt_pose(sample["kpt3d_sam"]["cam2"], "kpt3d_sam/cam2")
+                )
+                gt3d.append(self._merge_bt_pose(sample["kpt3d_gt"], "kpt3d_gt"))
 
             idx = sample.get("frame_indices")
             if isinstance(idx, torch.Tensor):
                 frame_indices.append(idx.view(-1))
 
             sample_meta = sample.get("meta", {})
-            num_frames = int(sample["kpt3d_gt"].shape[0])
+            if isinstance(idx, torch.Tensor):
+                num_frames = int(idx.numel())
+            elif has_3d:
+                num_frames = int(sample["kpt3d_gt"].shape[0])
+            elif has_2d:
+                num_frames = int(sample["kpt2d_sam"]["cam1"].shape[0])
+            else:
+                num_frames = int(sample["frames"]["cam1"].shape[2]) if has_frames else 0
             for t in range(num_frames):
                 row = (
                     dict(sample_meta)
@@ -135,29 +158,37 @@ class UnityDataModule(LightningDataModule):
                 row["time_index_in_sample"] = t
                 meta_rows.append(row)
 
-        return {
-            "frames": {
-                "cam1": torch.cat(frames_cam1, dim=0),
-                "cam2": torch.cat(frames_cam2, dim=0),
-            },
-            "kpt2d_gt": {
-                "cam1": torch.cat(gt2d_cam1, dim=0),
-                "cam2": torch.cat(gt2d_cam2, dim=0),
-            },
-            "kpt3d_gt": torch.cat(gt3d, dim=0),
-            "kpt2d_sam": {
-                "cam1": torch.cat(sam2d_cam1, dim=0),
-                "cam2": torch.cat(sam2d_cam2, dim=0),
-            },
-            "kpt3d_sam": {
-                "cam1": torch.cat(sam3d_cam1, dim=0),
-                "cam2": torch.cat(sam3d_cam2, dim=0),
-            },
+        out: Dict[str, Any] = {
             "frame_indices": torch.cat(frame_indices, dim=0)
             if frame_indices
             else torch.empty(0, dtype=torch.long),
             "meta": meta_rows,
         }
+
+        if has_frames:
+            out["frames"] = {
+                "cam1": torch.cat(frames_cam1, dim=0),
+                "cam2": torch.cat(frames_cam2, dim=0),
+            }
+
+        if has_2d:
+            out["kpt2d_gt"] = {
+                "cam1": torch.cat(gt2d_cam1, dim=0),
+                "cam2": torch.cat(gt2d_cam2, dim=0),
+            }
+            out["kpt2d_sam"] = {
+                "cam1": torch.cat(sam2d_cam1, dim=0),
+                "cam2": torch.cat(sam2d_cam2, dim=0),
+            }
+
+        if has_3d:
+            out["kpt3d_gt"] = torch.cat(gt3d, dim=0)
+            out["kpt3d_sam"] = {
+                "cam1": torch.cat(sam3d_cam1, dim=0),
+                "cam2": torch.cat(sam3d_cam2, dim=0),
+            }
+
+        return out
 
     def prepare_data(self) -> None:
         """here prepare the temp val data path,
@@ -180,6 +211,9 @@ class UnityDataModule(LightningDataModule):
             experiment=self._experiment,
             dataset_idx=self._dataset_idx["train"],
             transform=self.mapping_transform,
+            load_frames=self._load_frames,
+            load_2d_kpt=self._load_2d_kpt,
+            load_3d_kpt=self._load_3d_kpt,
         )
 
         # val dataset
@@ -187,6 +221,9 @@ class UnityDataModule(LightningDataModule):
             experiment=self._experiment,
             dataset_idx=self._dataset_idx["val"],
             transform=self.mapping_transform,
+            load_frames=self._load_frames,
+            load_2d_kpt=self._load_2d_kpt,
+            load_3d_kpt=self._load_3d_kpt,
         )
 
         # test dataset
@@ -194,6 +231,9 @@ class UnityDataModule(LightningDataModule):
             experiment=self._experiment,
             dataset_idx=self._dataset_idx["test"],
             transform=self.mapping_transform,
+            load_frames=self._load_frames,
+            load_2d_kpt=self._load_2d_kpt,
+            load_3d_kpt=self._load_3d_kpt,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -207,7 +247,7 @@ class UnityDataModule(LightningDataModule):
             self.train_gait_dataset,
             batch_size=self._batch_size,
             num_workers=self._num_workers,
-            pin_memory=False,
+            pin_memory=True,
             shuffle=True,
             drop_last=True,
             collate_fn=self._collate_fn,
@@ -226,7 +266,7 @@ class UnityDataModule(LightningDataModule):
             self.val_gait_dataset,
             batch_size=self._batch_size,
             num_workers=self._num_workers,
-            pin_memory=False,  # 🚀 GPU内存传输加速（改自False）
+            pin_memory=True,  # 🚀 GPU内存传输加速（改自False）
             shuffle=False,
             drop_last=True,
             collate_fn=self._collate_fn,
@@ -245,7 +285,7 @@ class UnityDataModule(LightningDataModule):
             self.test_gait_dataset,
             batch_size=self._batch_size,
             num_workers=self._num_workers,
-            pin_memory=False,  # 🚀 GPU内存传输加速（改自False）
+            pin_memory=True,  # 🚀 GPU内存传输加速（改自False）
             shuffle=False,
             drop_last=True,
             collate_fn=self._collate_fn,
