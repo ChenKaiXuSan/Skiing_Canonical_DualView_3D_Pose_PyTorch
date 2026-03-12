@@ -283,7 +283,7 @@ def main() -> None:
     if not pose_dir.exists() or not pose_dir.is_dir():
         raise FileNotFoundError(f"pose_dir not found: {pose_dir}")
 
-    files = sorted(pose_dir.glob(args.pattern))
+    files = sorted(pose_dir.rglob(args.pattern))
     if len(files) == 0:
         raise FileNotFoundError(
             f"No files matched pattern '{args.pattern}' in {pose_dir}"
