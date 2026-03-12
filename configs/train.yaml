@@ -41,7 +41,7 @@ data:
   load_2d_kpt: false # whether to load 2d keypoints
   load_3d_kpt: true
 
-  batch_size: 512
+  batch_size: 2048
 
 model:
   backbone: 3dcnn # choices=[3dcnn, 2dcnn, cnn_lstm, two_stream], help='the backbone of the model'
@@ -53,7 +53,7 @@ model:
 
 train:
   # Training config
-  max_epochs: 50 # numer of epochs of training
+  max_epochs: 100 # numer of epochs of training
 
   view: multi # single or multi
 
