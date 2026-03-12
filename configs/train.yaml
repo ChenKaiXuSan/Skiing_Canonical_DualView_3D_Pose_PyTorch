@@ -41,7 +41,7 @@ data:
   load_2d_kpt: false # whether to load 2d keypoints
   load_3d_kpt: true
 
-  batch_size: 64
+  batch_size: 512
 
 model:
   backbone: 3dcnn # choices=[3dcnn, 2dcnn, cnn_lstm, two_stream], help='the backbone of the model'
