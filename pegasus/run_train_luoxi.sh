@@ -3,7 +3,7 @@
 #PBS -q gpu
 #PBS -l elapstim_req=24:00:00
 #PBS -N fusion_SSM_train
-#PBS -t 0-4
+#PBS -t 0-9
 #PBS -o logs/pegasus/train_${PBS_SUBREQNO}.log
 #PBS -e logs/pegasus/train_${PBS_SUBREQNO}_err.log
 
@@ -24,13 +24,11 @@ DATA_ROOT="/work/SSR/share/data/skiing/skiing_unity_dataset"
 INDEX_MAPPING_DIR="${DATA_ROOT}/index_mapping"
 INDEX_MAPPING_PATH="${INDEX_MAPPING_DIR}/camera_pairs_by_action_folds"
 
-MAX_EPOCHS=50
-
 MODEL_BACKBONE="3dcnn"
 FUSE_METHOD="mamba_ssm"
 
-NUM_WORKERS=16
-BATCH_SIZE=32
+NUM_WORKERS=32
+BATCH_SIZE=2048
 
 # fold assignment:
 # - PBS array mode: use PBS_ARRAY_INDEX
@@ -51,7 +49,6 @@ python -m project.main \
     data.index_mapping=${INDEX_MAPPING_DIR} \
     data.index_mapping_path=${INDEX_MAPPING_PATH} \
     train.gpu=0 \
-    train.max_epochs=${MAX_EPOCHS} \
     data.num_workers=${NUM_WORKERS} \
     data.batch_size=${BATCH_SIZE} \
     model.backbone=${MODEL_BACKBONE} \
