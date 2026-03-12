@@ -22,7 +22,7 @@ conda env list
 # === 2. 训练参数（按需修改） ===
 DATA_ROOT="/work/SSR/share/data/skiing/skiing_unity_dataset"
 INDEX_MAPPING_DIR="${DATA_ROOT}/index_mapping"
-INDEX_MAPPING_FILE="camera_pairs_by_action.json"
+INDEX_MAPPING_PATH="${INDEX_MAPPING_DIR}/camera_pairs_by_action_folds"
 
 MAX_EPOCHS=50
 
@@ -30,7 +30,7 @@ MODEL_BACKBONE="3dcnn"
 FUSE_METHOD="mamba_ssm"
 
 NUM_WORKERS=16
-BATCH_SIZE=16
+BATCH_SIZE=32
 
 # fold assignment:
 # - PBS array mode: use PBS_ARRAY_INDEX
@@ -40,7 +40,7 @@ FOLD_ID=${PBS_SUBREQNO:-${FOLD_ID:-0}}
 echo "🏁 Train job started at: $(date)"
 echo "Project Root: ${PROJECT_ROOT}"
 echo "Data Root: ${DATA_ROOT}"
-echo "Index Mapping: ${INDEX_MAPPING_DIR}/${INDEX_MAPPING_FILE}"
+echo "Index Mapping: ${INDEX_MAPPING_PATH}"
 echo "GPU: 0, Epochs: ${MAX_EPOCHS}, Workers: ${NUM_WORKERS}"
 echo "Backbone: ${MODEL_BACKBONE}, Fuse: ${FUSE_METHOD}"
 echo "Fold: ${FOLD_ID}"
@@ -49,7 +49,7 @@ echo "Fold: ${FOLD_ID}"
 python -m project.main \
     data.root_path=${DATA_ROOT} \
     data.index_mapping=${INDEX_MAPPING_DIR} \
-    data.index_mapping_file=${INDEX_MAPPING_FILE} \
+    data.index_mapping_path=${INDEX_MAPPING_PATH} \
     train.gpu=0 \
     train.max_epochs=${MAX_EPOCHS} \
     data.num_workers=${NUM_WORKERS} \
