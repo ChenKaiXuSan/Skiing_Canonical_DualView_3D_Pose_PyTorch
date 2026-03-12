@@ -69,6 +69,17 @@ def _save_folds_separately(
     return saved_files
 
 
+def _remove_legacy_aggregate_file(index_mapping_dir: Path, strategy: str) -> None:
+    """Remove old aggregate JSON file if it exists.
+
+    The new workflow keeps only split fold files.
+    """
+    aggregate_file = index_mapping_dir / f"camera_pairs_{strategy}.json"
+    if aggregate_file.exists():
+        aggregate_file.unlink()
+        print(f"  已删除旧的整体索引文件: {aggregate_file}")
+
+
 def generate_index_files(
     data_root: str,
     num_persons: int = 2,
@@ -124,21 +135,35 @@ def generate_index_files(
             n_splits=n_splits,
             index_save_path=str(index_mapping_dir / f"camera_pairs_{strategy}.json")
         )
-        
-        # 生成并保存索引
-        folds = cv(force_recreate=force_recreate)
+
+        # 仅生成 fold 划分文件，不再保存整体聚合 json。
+        fold_dir = index_mapping_dir / f"camera_pairs_{strategy}_folds"
+        if fold_dir.exists() and not force_recreate:
+            fold_files = sorted(p.resolve() for p in fold_dir.glob("fold_*.json"))
+            if fold_files:
+                print("✓ 发现已存在的 fold 划分文件，直接复用")
+                results[strategy] = {
+                    "fold_dir": str(fold_dir.resolve()),
+                    "fold_files": fold_files,
+                    "n_folds": len(fold_files),
+                    "total_samples": "unknown",
+                }
+                print(f"  Fold目录: {results[strategy]['fold_dir']}")
+                print(f"  Fold文件数: {len(fold_files)}")
+                continue
+
+        folds = cv.prepare_folds()
         fold_files = _save_folds_separately(
             folds=folds,
             strategy=strategy,
             index_mapping_dir=index_mapping_dir,
         )
+        _remove_legacy_aggregate_file(index_mapping_dir, strategy)
         
         # 记录结果
-        strategy_index_file = (index_mapping_dir / f"camera_pairs_{strategy}.json").resolve()
         strategy_fold_dir = (index_mapping_dir / f"camera_pairs_{strategy}_folds").resolve()
 
         results[strategy] = {
-            "file": str(strategy_index_file),
             "fold_dir": str(strategy_fold_dir),
             "fold_files": fold_files,
             "n_folds": len(folds),
@@ -146,8 +171,7 @@ def generate_index_files(
                                 for fold in folds.values()) // len(folds)
         }
         
-        print(f"\n✓ 策略 '{strategy}' 索引文件已生成")
-        print(f"  文件路径: {results[strategy]['file']}")
+        print(f"\n✓ 策略 '{strategy}' fold 索引文件已生成")
         print(f"  Fold目录: {results[strategy]['fold_dir']}")
         print(f"  Fold文件数: {len(fold_files)}")
         for fold_file in fold_files:
@@ -163,17 +187,12 @@ def generate_index_files(
     for strategy, info in results.items():
         fold_files_summary = cast(List[Path], info.get("fold_files", []))
         print(f"\n[{strategy}]")
-        print(f"  文件: {info['file']}")
         print(f"  Fold目录: {info['fold_dir']}")
         print(f"  Fold文件数: {len(fold_files_summary)}")
         print(f"  折数: {info['n_folds']}")
-        print(f"  样本数: {info['total_samples']:,}")
-        
-        # 获取文件大小
-        file_path = Path(str(info['file']))
-        if file_path.exists():
-            size_mb = file_path.stat().st_size / (1024 * 1024)
-            print(f"  文件大小: {size_mb:.2f} MB")
+        total_samples = info["total_samples"]
+        if isinstance(total_samples, int):
+            print(f"  样本数: {total_samples:,}")
     
     print("\n" + "="*80)
     print("📁 所有索引文件位置:")
