@@ -34,13 +34,13 @@ data:
   # index_mapping_file: camera_pairs_by_action.json # precomputed index mapping json file name
   index_mapping_path: ${data.index_mapping}/camera_pairs_by_action_folds # precomputed index mapping json file path
 
-  num_workers: 16
+  num_workers: 32
   img_size: 224
   load_frames: false # whether to load video frames
   load_2d_kpt: false # whether to load 2d keypoints
   load_3d_kpt: true
 
-  batch_size: 32
+  batch_size: 64
 
 model:
   backbone: 3dcnn # choices=[3dcnn, 2dcnn, cnn_lstm, two_stream], help='the backbone of the model'
