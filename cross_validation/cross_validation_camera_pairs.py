@@ -22,7 +22,7 @@ Copyright (c) 2026 The University of Tsukuba
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from itertools import combinations
 
 import numpy as np
@@ -44,8 +44,10 @@ class CameraPairSample:
     cam1_kpt2d_dir: Optional[str] = None
     cam2_kpt2d_dir: Optional[str] = None
     kpt3d_dir: Optional[str] = None
-    sam3d_cam1_dir: Optional[str] = None
-    sam3d_cam2_dir: Optional[str] = None
+    sam3d_cam1_kpt2d_dir: Optional[str] = None
+    sam3d_cam2_kpt2d_dir: Optional[str] = None
+    sam3d_cam1_kpt3d_dir: Optional[str] = None
+    sam3d_cam2_kpt3d_dir: Optional[str] = None
     sequence_meta_path: Optional[str] = None
     joint_names_path: Optional[str] = None
     
@@ -54,7 +56,8 @@ class CameraPairSample:
     
     @classmethod
     def from_dict(cls, d: Dict):
-        return cls(**d)
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 class CameraPairCrossValidation:
@@ -79,11 +82,15 @@ class CameraPairCrossValidation:
         num_cameras: int = 108,
         split_strategy: str = "by_person",  # by_person, by_action, by_camera_pair
         n_splits: int = 5,
+        sam3d_export_root: Optional[str] = None,
         index_save_path: Optional[str] = None,
     ):
         self.data_root = Path(data_root)
         self.data_dir = self.data_root / "data"
-        self.sam3d_root = self.data_root / "sam3d_body_results" / "inference"
+        self.sam3d_export_root = (
+            Path(sam3d_export_root) if sam3d_export_root
+            else self.data_root / "modalities_from_sam3d"
+        )
         self.num_persons = num_persons
         self.num_actions = num_actions
         self.num_cameras = num_cameras
@@ -141,7 +148,7 @@ class CameraPairCrossValidation:
                 kpt2d_root = action_dir / "kpt2d"
                 kpt3d_dir = action_dir / "kpt3d"
                 meta_dir = action_dir / "meta"
-                sam3d_frames_root = self.sam3d_root / person_id / action_id / "frames"
+                sam3d_export_action = self.sam3d_export_root / person_id / action_id
 
                 capture_dirs = sorted(p for p in frames_root.iterdir() if p.is_dir() and p.name.startswith("capture_"))
                 if len(capture_dirs) < 2:
@@ -156,8 +163,10 @@ class CameraPairCrossValidation:
                     kpt2d_cam1 = kpt2d_root / self._capture_to_kpt2d_id(cam1_id)
                     kpt2d_cam2 = kpt2d_root / self._capture_to_kpt2d_id(cam2_id)
 
-                    sam3d_cam1 = sam3d_frames_root / cam1_id
-                    sam3d_cam2 = sam3d_frames_root / cam2_id
+                    sam3d_cam1_kpt2d = sam3d_export_action / "kpt2d" / cam1_id
+                    sam3d_cam2_kpt2d = sam3d_export_action / "kpt2d" / cam2_id
+                    sam3d_cam1_kpt3d = sam3d_export_action / "kpt3d" / cam1_id
+                    sam3d_cam2_kpt3d = sam3d_export_action / "kpt3d" / cam2_id
 
                     sequence_meta = meta_dir / "sequence.json"
                     joint_meta = meta_dir / "joint_names.json"
@@ -175,8 +184,10 @@ class CameraPairCrossValidation:
                         cam1_kpt2d_dir=str(kpt2d_cam1.resolve()),
                         cam2_kpt2d_dir=str(kpt2d_cam2.resolve()),
                         kpt3d_dir=str(kpt3d_dir.resolve()),
-                        sam3d_cam1_dir=str(sam3d_cam1.resolve()),
-                        sam3d_cam2_dir=str(sam3d_cam2.resolve()),
+                        sam3d_cam1_kpt2d_dir=str(sam3d_cam1_kpt2d.resolve()),
+                        sam3d_cam2_kpt2d_dir=str(sam3d_cam2_kpt2d.resolve()),
+                        sam3d_cam1_kpt3d_dir=str(sam3d_cam1_kpt3d.resolve()),
+                        sam3d_cam2_kpt3d_dir=str(sam3d_cam2_kpt3d.resolve()),
                         sequence_meta_path=str(sequence_meta.resolve()),
                         joint_names_path=str(joint_meta.resolve()),
                     )

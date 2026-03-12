@@ -467,22 +467,29 @@ class LabeledUnityDataset(Dataset):
         cam1_kpt2d_dir = Path(item["cam1_kpt2d_dir"])
         cam2_kpt2d_dir = Path(item["cam2_kpt2d_dir"])
         kpt3d_dir = Path(item["kpt3d_dir"])
-        sam3d_cam1_dir = Path(item["sam3d_cam1_dir"])
-        sam3d_cam2_dir = Path(item["sam3d_cam2_dir"])
+        sam3d_cam1_kpt2d_dir = Path(item["sam3d_cam1_kpt2d_dir"])
+        sam3d_cam2_kpt2d_dir = Path(item["sam3d_cam2_kpt2d_dir"])
+        sam3d_cam1_kpt3d_dir = Path(item["sam3d_cam1_kpt3d_dir"])
+        sam3d_cam2_kpt3d_dir = Path(item["sam3d_cam2_kpt3d_dir"])
 
         cam1_frames_map = self._build_idx_file_map(cam1_frames_dir, "frame_*.png") if self._load_frames else {}
         cam2_frames_map = self._build_idx_file_map(cam2_frames_dir, "frame_*.png") if self._load_frames else {}
         cam1_kpt2d_map = self._build_idx_file_map(cam1_kpt2d_dir, "kpt2d_*.npy") if self._load_2d_kpt else {}
         cam2_kpt2d_map = self._build_idx_file_map(cam2_kpt2d_dir, "kpt2d_*.npy") if self._load_2d_kpt else {}
         kpt3d_map = self._build_idx_file_map(kpt3d_dir, "frame_*.npy") if self._load_3d_kpt else {}
-        sam3d_cam1_map = self._build_idx_file_map(sam3d_cam1_dir, "*_sam3d_body.npz")
-        sam3d_cam2_map = self._build_idx_file_map(sam3d_cam2_dir, "*_sam3d_body.npz")
+        sam3d_cam1_kpt2d_map = self._build_idx_file_map(sam3d_cam1_kpt2d_dir, "kpt2d_*.npy") if self._load_2d_kpt else {}
+        sam3d_cam2_kpt2d_map = self._build_idx_file_map(sam3d_cam2_kpt2d_dir, "kpt2d_*.npy") if self._load_2d_kpt else {}
+        sam3d_cam1_kpt3d_map = self._build_idx_file_map(sam3d_cam1_kpt3d_dir, "kpt3d_*.npy") if self._load_3d_kpt else {}
+        sam3d_cam2_kpt3d_map = self._build_idx_file_map(sam3d_cam2_kpt3d_dir, "kpt3d_*.npy") if self._load_3d_kpt else {}
 
+        # none_detected_frames.txt is copied to both kpt2d and kpt3d dirs by the export script
+        cam1_none_dir = sam3d_cam1_kpt2d_dir if self._load_2d_kpt else sam3d_cam1_kpt3d_dir
+        cam2_none_dir = sam3d_cam2_kpt2d_dir if self._load_2d_kpt else sam3d_cam2_kpt3d_dir
         cam1_none_exists, cam1_none_idx, cam1_none_invalid = self._read_none_detected_indices(
-            sam3d_cam1_dir
+            cam1_none_dir
         )
         cam2_none_exists, cam2_none_idx, cam2_none_invalid = self._read_none_detected_indices(
-            sam3d_cam2_dir
+            cam2_none_dir
         )
         if cam1_none_exists and cam1_none_invalid:
             logger.warning(
@@ -512,10 +519,17 @@ class LabeledUnityDataset(Dataset):
         if all_common_set is None:
             raise RuntimeError("No modality selected for aligned frame discovery.")
         all_common = sorted(all_common_set)
+        sam_valid_set: Optional[set[int]] = None
+        if self._load_2d_kpt:
+            both_2d = set(sam3d_cam1_kpt2d_map) & set(sam3d_cam2_kpt2d_map)
+            sam_valid_set = both_2d if sam_valid_set is None else sam_valid_set & both_2d
+        if self._load_3d_kpt:
+            both_3d = set(sam3d_cam1_kpt3d_map) & set(sam3d_cam2_kpt3d_map)
+            sam_valid_set = both_3d if sam_valid_set is None else sam_valid_set & both_3d
+        sam_valid_set = sam_valid_set or set()
         common_idx = [
             idx for idx in all_common
-            if idx in sam3d_cam1_map
-            and idx in sam3d_cam2_map
+            if idx in sam_valid_set
             and idx not in cam1_none_set
             and idx not in cam2_none_set
         ]
@@ -599,10 +613,9 @@ class LabeledUnityDataset(Dataset):
                 gt_kpt3d_np = self._filter_keypoints_with_indices(gt3d_raw, gt_3d_sel)
                 gt_kpt3d.append(torch.from_numpy(gt_kpt3d_np))
 
-            sam1_2d, sam1_3d = self._load_sam3d_file(sam3d_cam1_map[idx])
-            sam2_2d, sam2_3d = self._load_sam3d_file(sam3d_cam2_map[idx])
-
             if self._load_2d_kpt:
+                sam1_2d = np.asarray(np.load(sam3d_cam1_kpt2d_map[idx]), dtype=np.float32)
+                sam2_2d = np.asarray(np.load(sam3d_cam2_kpt2d_map[idx]), dtype=np.float32)
                 if sam1_2d_sel is None:
                     sam1_2d_sel = self._get_or_build_source_joint_indices(sam1_2d.shape[0])
                 if sam2_2d_sel is None:
@@ -619,6 +632,8 @@ class LabeledUnityDataset(Dataset):
                 )
 
             if self._load_3d_kpt:
+                sam1_3d = np.asarray(np.load(sam3d_cam1_kpt3d_map[idx]), dtype=np.float32)
+                sam2_3d = np.asarray(np.load(sam3d_cam2_kpt3d_map[idx]), dtype=np.float32)
                 if sam1_3d_sel is None:
                     sam1_3d_sel = self._get_or_build_source_joint_indices(sam1_3d.shape[0])
                 if sam2_3d_sel is None:

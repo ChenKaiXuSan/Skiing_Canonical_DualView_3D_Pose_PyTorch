@@ -33,6 +33,7 @@ data:
   index_mapping: ${data.root_path}/index_mapping # precomputed index mapping directory
   # index_mapping_file: camera_pairs_by_action.json # precomputed index mapping json file name
   index_mapping_path: ${data.index_mapping}/camera_pairs_by_action_folds # precomputed index mapping json file path
+  sam3d_export_path: ${data.root_path}/sam3d_body_results/modalities_from_sam3d # exported kpt2d/kpt3d from SAM3D
 
   num_workers: 32
   img_size: 224

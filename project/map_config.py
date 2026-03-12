@@ -102,7 +102,9 @@ class UnityDataConfig:
     cam1_kpt2d_dir: str
     cam2_kpt2d_dir: str
     kpt3d_dir: str
-    sam3d_cam1_dir: str
-    sam3d_cam2_dir: str
+    sam3d_cam1_kpt2d_dir: str
+    sam3d_cam2_kpt2d_dir: str
+    sam3d_cam1_kpt3d_dir: str
+    sam3d_cam2_kpt3d_dir: str
     sequence_meta_path: str
     joint_names_path: str

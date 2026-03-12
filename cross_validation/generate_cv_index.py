@@ -88,6 +88,7 @@ def generate_index_files(
     strategies: Optional[List[str]] = None,
     n_splits: int = 5,
     force_recreate: bool = False,
+    sam3d_export_root: Optional[str] = None,
 ):
     """
     生成所有策略的索引文件
@@ -133,7 +134,8 @@ def generate_index_files(
             num_cameras=num_cameras,
             split_strategy=strategy,
             n_splits=n_splits,
-            index_save_path=str(index_mapping_dir / f"camera_pairs_{strategy}.json")
+              sam3d_export_root=sam3d_export_root,
+              index_save_path=str(index_mapping_dir / f"camera_pairs_{strategy}.json")
         )
 
         # 仅生成 fold 划分文件，不再保存整体聚合 json。
@@ -228,6 +230,7 @@ def hydra_main(cfg: Optional[DictConfig] = None) -> None:
         strategies=list(cv_cfg.strategies),
         n_splits=int(cv_cfg.n_splits),
         force_recreate=bool(cv_cfg.force_recreate),
+        sam3d_export_root=str(cfg.data.get("sam3d_export_path", "")),
     )
 
 if __name__ == "__main__":
