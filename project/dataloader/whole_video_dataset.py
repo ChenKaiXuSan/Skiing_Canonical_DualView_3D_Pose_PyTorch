@@ -484,45 +484,37 @@ class LabeledUnityDataset(Dataset):
                 cam2_none_invalid[:5],
             )
 
-        common_idx = sorted(
+        # 跳过两摄像头中任意一个没有 SAM 检测结果的帧
+        cam1_none_set = set(cam1_none_idx)
+        cam2_none_set = set(cam2_none_idx)
+        all_common = sorted(
             set(cam1_frames_map)
             & set(cam2_frames_map)
             & set(cam1_kpt2d_map)
             & set(cam2_kpt2d_map)
             & set(kpt3d_map)
         )
+        common_idx = [
+            idx for idx in all_common
+            if idx in sam3d_cam1_map
+            and idx in sam3d_cam2_map
+            and idx not in cam1_none_set
+            and idx not in cam2_none_set
+        ]
+        skipped = len(all_common) - len(common_idx)
+        if skipped:
+            logger.debug(
+                "Skipped %d/%d frames with missing SAM data for %s/%s/%s-%s",
+                skipped, len(all_common),
+                item.get('person_id', '?'), item.get('action_id', '?'),
+                item.get('cam1_id', '?'), item.get('cam2_id', '?'),
+            )
         if not common_idx:
             raise RuntimeError(
-                "No common frame indices across frame/2d/3d modalities for sample: "
+                "No valid frames with SAM data for sample: "
                 f"{item.get('person_id', 'unknown')} / {item.get('action_id', 'unknown')} / "
                 f"{item.get('cam1_id', 'unknown')} - {item.get('cam2_id', 'unknown')}"
             )
-
-        cam1_missing_idx = sorted(i for i in common_idx if i not in sam3d_cam1_map)
-        cam2_missing_idx = sorted(i for i in common_idx if i not in sam3d_cam2_map)
-        self._log_missing_sam_paths(
-            camera_id=item.get("cam1_id", "unknown"),
-            sam_dir=sam3d_cam1_dir,
-            missing_indices=cam1_missing_idx,
-        )
-        self._log_missing_sam_paths(
-            camera_id=item.get("cam2_id", "unknown"),
-            sam_dir=sam3d_cam2_dir,
-            missing_indices=cam2_missing_idx,
-        )
-
-        sam_cam1_resolved = self._resolve_sam_sequence_with_fallback(
-            frame_indices=common_idx,
-            sam_file_map=sam3d_cam1_map,
-            camera_id=item.get("cam1_id", "unknown"),
-            none_detected_indices=set(cam1_none_idx),
-        )
-        sam_cam2_resolved = self._resolve_sam_sequence_with_fallback(
-            frame_indices=common_idx,
-            sam_file_map=sam3d_cam2_map,
-            camera_id=item.get("cam2_id", "unknown"),
-            none_detected_indices=set(cam2_none_idx),
-        )
 
         cam1_frames: List[torch.Tensor] = []
         cam2_frames: List[torch.Tensor] = []
@@ -587,8 +579,8 @@ class LabeledUnityDataset(Dataset):
             cam2_kpt2d.append(torch.from_numpy(cam2_kpt2d_np))
             gt_kpt3d.append(torch.from_numpy(gt_kpt3d_np))
 
-            sam1_2d, sam1_3d = sam_cam1_resolved[idx]
-            sam2_2d, sam2_3d = sam_cam2_resolved[idx]
+            sam1_2d, sam1_3d = self._load_sam3d_file(sam3d_cam1_map[idx])
+            sam2_2d, sam2_3d = self._load_sam3d_file(sam3d_cam2_map[idx])
 
             if sam1_2d_sel is None:
                 sam1_2d_sel = self._get_or_build_source_joint_indices(sam1_2d.shape[0])

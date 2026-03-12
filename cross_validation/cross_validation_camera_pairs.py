@@ -94,6 +94,7 @@ class CameraPairCrossValidation:
             self.index_save_path: Path = self.data_root / "index_mapping" / f"camera_pairs_{split_strategy}.json"
         else:
             self.index_save_path = Path(index_save_path)
+        self.index_save_path = self.index_save_path.resolve()
         
         self.index_save_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -166,18 +167,18 @@ class CameraPairCrossValidation:
                         action_id=action_id,
                         cam1_id=cam1_id,
                         cam2_id=cam2_id,
-                        cam1_path=str(cam1_dir),
-                        cam2_path=str(cam2_dir),
-                        label_path=str(sequence_meta),
-                        cam1_frames_dir=str(cam1_dir),
-                        cam2_frames_dir=str(cam2_dir),
-                        cam1_kpt2d_dir=str(kpt2d_cam1),
-                        cam2_kpt2d_dir=str(kpt2d_cam2),
-                        kpt3d_dir=str(kpt3d_dir),
-                        sam3d_cam1_dir=str(sam3d_cam1),
-                        sam3d_cam2_dir=str(sam3d_cam2),
-                        sequence_meta_path=str(sequence_meta),
-                        joint_names_path=str(joint_meta),
+                        cam1_path=str(cam1_dir.resolve()),
+                        cam2_path=str(cam2_dir.resolve()),
+                        label_path=str(sequence_meta.resolve()),
+                        cam1_frames_dir=str(cam1_dir.resolve()),
+                        cam2_frames_dir=str(cam2_dir.resolve()),
+                        cam1_kpt2d_dir=str(kpt2d_cam1.resolve()),
+                        cam2_kpt2d_dir=str(kpt2d_cam2.resolve()),
+                        kpt3d_dir=str(kpt3d_dir.resolve()),
+                        sam3d_cam1_dir=str(sam3d_cam1.resolve()),
+                        sam3d_cam2_dir=str(sam3d_cam2.resolve()),
+                        sequence_meta_path=str(sequence_meta.resolve()),
+                        joint_names_path=str(joint_meta.resolve()),
                     )
                     samples.append(sample)
 
@@ -194,69 +195,135 @@ class CameraPairCrossValidation:
     
     def split_by_person(self, samples: List[CameraPairSample]) -> Dict[int, Dict[str, Any]]:
         """
-        策略1: 按人物划分 (Leave-One-Person-Out)
-        每一折使用一个人的数据作为验证集，其他人的数据作为训练集
+        策略1: 按人物划分 (Leave-One-Person-Out with train/val/test split)
+        每一折使用一个人的数据进行 7/2/1 train/val/test 划分
+        其他人的数据全部作为额外的训练数据
         """
         fold_dict: Dict[int, Dict[str, Any]] = {}
         
         person_ids = sorted(set(s.person_id for s in samples))
         
         if len(person_ids) <= 1:
-            return {0: {"train": samples, "val": [], "val_person": person_ids[0] if person_ids else "unknown"}}
+            return {0: {"train": samples, "val": [], "test": [], "val_person": person_ids[0] if person_ids else "unknown"}}
 
-        for fold_idx, val_person in enumerate(person_ids):
-            train_samples = [s for s in samples if s.person_id != val_person]
-            val_samples = [s for s in samples if s.person_id == val_person]
+        rng = np.random.default_rng(42)
+        
+        for fold_idx, test_person in enumerate(person_ids):
+            # 将测试人物的数据分成 train:val:test = 7:2:1
+            test_person_samples = [s for s in samples if s.person_id == test_person]
+            
+            # 随机打乱测试人物的样本
+            shuffled_test_samples = test_person_samples.copy()
+            rng_fold = np.random.default_rng(int(rng.integers(0, 10_000_000)) + fold_idx)
+            rng_fold.shuffle(shuffled_test_samples)
+            
+            n_total = len(shuffled_test_samples)
+            n_train_person = int(round(n_total * 0.7))
+            n_val_person = int(round(n_total * 0.2))
+            n_test_person = n_total - n_train_person - n_val_person
+            
+            # 保证非空
+            if n_total >= 3:
+                if n_train_person <= 0:
+                    n_train_person = 1
+                if n_val_person <= 0:
+                    n_val_person = 1
+                n_test_person = n_total - n_train_person - n_val_person
+                if n_test_person <= 0:
+                    n_test_person = 1
+                    if n_train_person > n_val_person:
+                        n_train_person -= 1
+                    else:
+                        n_val_person -= 1
+            
+            train_person_samples = shuffled_test_samples[:n_train_person]
+            val_person_samples = shuffled_test_samples[n_train_person:n_train_person + n_val_person]
+            test_person_samples_split = shuffled_test_samples[n_train_person + n_val_person:]
+            
+            # 其他人的数据全部作为训练数据
+            other_samples = [s for s in samples if s.person_id != test_person]
+            
+            final_train = train_person_samples + other_samples
+            final_val = val_person_samples
+            final_test = test_person_samples_split
             
             fold_dict[fold_idx] = {
-                "train": train_samples,
-                "val": val_samples,
-                "val_person": val_person,
+                "train": final_train,
+                "val": final_val,
+                "test": final_test,
+                "val_person": test_person,
+                "ratio": "7/2/1",
             }
             
-            print(f"Fold {fold_idx}: train={len(train_samples)}, val={len(val_samples)} (person={val_person})")
+            print(f"Fold {fold_idx}: train={len(final_train)}, val={len(final_val)}, test={len(final_test)} (person={test_person})")
         
         return fold_dict
     
     def split_by_action(self, samples: List[CameraPairSample]) -> Dict[int, Dict[str, Any]]:
         """
-        策略2: 按动作划分 (K-Fold on actions)
-        将动作分成K折，每折某些动作用于验证，其他用于训练
+        策略2: 按动作划分 (K-Fold on actions with train/val/test split)
+        将动作分成K折，每折某些动作用于训练、验证和测试
         """
         fold_dict: Dict[int, Dict[str, Any]] = {}
         
         action_ids = sorted(set(s.action_id for s in samples))
         n_splits = min(self.n_splits, len(action_ids))
         if n_splits <= 1:
-            return {0: {"train": samples, "val": [], "val_actions": []}}
+            return {0: {"train": samples, "val": [], "test": [], "val_actions": [], "test_actions": []}}
 
+        # 方案：将所有actions分成多组进行K折CV
+        # 对于每一fold，使用不同的actions作为train/val/test
         kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        action_ids_array = np.array(action_ids)
         
-        for fold_idx, (train_action_indices, val_action_indices) in enumerate(kf.split(action_ids)):
-            train_actions = [action_ids[i] for i in train_action_indices]
-            val_actions = [action_ids[i] for i in val_action_indices]
+        fold_splits = list(kf.split(action_ids_array))
+        rng = np.random.default_rng(42)
+        
+        for fold_idx in range(n_splits):
+            # 方式：当前fold的train_action_indices为train
+            # val_test_action_indices再分出2/3为val，1/3为test
+            train_action_indices, val_test_action_indices = fold_splits[fold_idx]
             
-            train_samples = [s for s in samples if s.action_id in train_actions]
+            train_actions_set = set(action_ids_array[train_action_indices])
+            val_test_actions = action_ids_array[val_test_action_indices]
+            
+            # 随机打乱验证+测试actions
+            shuffled_val_test = val_test_actions.copy()
+            rng_fold = np.random.default_rng(int(rng.integers(0, 10_000_000)) + fold_idx)
+            rng_fold.shuffle(shuffled_val_test)
+            
+            n_val_test = len(shuffled_val_test)
+            n_val = max(1, int(round(n_val_test * 0.67)))  # 2/3 for val
+            n_test = n_val_test - n_val  # 1/3 for test
+            
+            val_actions = set(shuffled_val_test[:n_val])
+            test_actions = set(shuffled_val_test[n_val:])
+            
+            train_samples = [s for s in samples if s.action_id in train_actions_set]
             val_samples = [s for s in samples if s.action_id in val_actions]
+            test_samples = [s for s in samples if s.action_id in test_actions]
             
             fold_dict[fold_idx] = {
                 "train": train_samples,
                 "val": val_samples,
-                "val_actions": val_actions,
+                "test": test_samples,
+                "val_actions": sorted(list(val_actions)),
+                "test_actions": sorted(list(test_actions)),
+                "ratio": "7/2/1",
             }
             
-            print(f"Fold {fold_idx}: train={len(train_samples)}, val={len(val_samples)} (actions={val_actions})")
+            print(f"Fold {fold_idx}: train={len(train_samples)}, val={len(val_samples)}, test={len(test_samples)} (actions: train={len(train_actions_set)}, val={len(val_actions)}, test={len(test_actions)})")
         
         return fold_dict
     
     def split_by_camera_pair(self, samples: List[CameraPairSample]) -> Dict[int, Dict[str, Any]]:
         """
-        策略3: 按摄像头对划分 (K-Fold on camera pairs)
-        将摄像头对分成K折进行交叉验证
+        策略3: 按摄像头对划分（每个fold内按7/2/1切分train/val/test）
+        每个fold都会基于相机对产生独立的 train/val/test。
         
         注意：这种方式会产生大量的样本，可能需要采样或分层
         """
-        fold_dict: Dict[int, Dict[str, List[CameraPairSample]]] = {}
+        fold_dict: Dict[int, Dict[str, Any]] = {}
         
         # 按照 (person, action, cam_pair) 分组
         # 为了简化，我们可以只按摄像头对来划分
@@ -270,25 +337,54 @@ class CameraPairCrossValidation:
             samples = [samples[i] for i in sampled_indices]
             camera_pairs = list(set((s.cam1_id, s.cam2_id) for s in samples))
         
-        n_splits = min(self.n_splits, len(camera_pairs))
-        if n_splits <= 1:
-            return {0: {"train": samples, "val": []}}
+        n_splits = max(1, min(self.n_splits, len(camera_pairs)))
 
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        
-        for fold_idx, (train_pair_indices, val_pair_indices) in enumerate(kf.split(camera_pairs)):
-            train_pairs = set(camera_pairs[i] for i in train_pair_indices)
-            val_pairs = set(camera_pairs[i] for i in val_pair_indices)
-            
+        rng = np.random.default_rng(42)
+        camera_pairs = list(camera_pairs)
+
+        for fold_idx in range(n_splits):
+            shuffled_pairs = camera_pairs.copy()
+            rng_fold = np.random.default_rng(int(rng.integers(0, 10_000_000)) + fold_idx)
+            rng_fold.shuffle(shuffled_pairs)
+
+            n_total_pairs = len(shuffled_pairs)
+            n_train_pairs = int(round(n_total_pairs * 0.7))
+            n_val_pairs = int(round(n_total_pairs * 0.2))
+            n_test_pairs = n_total_pairs - n_train_pairs - n_val_pairs
+
+            # Keep all splits non-empty when possible.
+            if n_total_pairs >= 3:
+                if n_train_pairs <= 0:
+                    n_train_pairs = 1
+                if n_val_pairs <= 0:
+                    n_val_pairs = 1
+                n_test_pairs = n_total_pairs - n_train_pairs - n_val_pairs
+                if n_test_pairs <= 0:
+                    n_test_pairs = 1
+                    if n_train_pairs > n_val_pairs:
+                        n_train_pairs -= 1
+                    else:
+                        n_val_pairs -= 1
+
+            train_pairs = set(shuffled_pairs[:n_train_pairs])
+            val_pairs = set(shuffled_pairs[n_train_pairs:n_train_pairs + n_val_pairs])
+            test_pairs = set(shuffled_pairs[n_train_pairs + n_val_pairs:])
+
             train_samples = [s for s in samples if (s.cam1_id, s.cam2_id) in train_pairs]
             val_samples = [s for s in samples if (s.cam1_id, s.cam2_id) in val_pairs]
-            
+            test_samples = [s for s in samples if (s.cam1_id, s.cam2_id) in test_pairs]
+
             fold_dict[fold_idx] = {
                 "train": train_samples,
                 "val": val_samples,
+                "test": test_samples,
+                "ratio": "7/2/1",
             }
-            
-            print(f"Fold {fold_idx}: train={len(train_samples)}, val={len(val_samples)}")
+
+            print(
+                f"Fold {fold_idx}: train={len(train_samples)}, "
+                f"val={len(val_samples)}, test={len(test_samples)}"
+            )
         
         return fold_dict
     
@@ -326,10 +422,11 @@ class CameraPairCrossValidation:
             serialized[str(fold_idx)] = {
                 "train": [s.to_dict() for s in fold_data["train"]],
                 "val": [s.to_dict() for s in fold_data["val"]],
+                "test": [s.to_dict() for s in fold_data.get("test", [])],
             }
             # 保存额外信息（如验证集的人物或动作）
             for key in fold_data:
-                if key not in ["train", "val"]:
+                if key not in ["train", "val", "test"]:
                     serialized[str(fold_idx)][key] = fold_data[key]
         
         # 添加元数据
@@ -339,7 +436,7 @@ class CameraPairCrossValidation:
             "num_cameras": self.num_cameras,
             "split_strategy": self.split_strategy,
             "n_splits": len(fold_dict),
-            "total_samples": sum(len(fold_data["train"]) + len(fold_data["val"]) 
+            "total_samples": sum(len(fold_data["train"]) + len(fold_data["val"]) + len(fold_data.get("test", [])) 
                                 for fold_data in fold_dict.values()) // len(fold_dict),
         }
         
@@ -372,10 +469,11 @@ class CameraPairCrossValidation:
             fold_dict[fold_idx] = {
                 "train": [CameraPairSample.from_dict(d) for d in fold_data["train"]],
                 "val": [CameraPairSample.from_dict(d) for d in fold_data["val"]],
+                "test": [CameraPairSample.from_dict(d) for d in fold_data.get("test", [])],
             }
             # 恢复额外信息
             for key in fold_data:
-                if key not in ["train", "val"]:
+                if key not in ["train", "val", "test"]:
                     fold_dict[fold_idx][key] = fold_data[key]
         
         return fold_dict

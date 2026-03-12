@@ -192,7 +192,7 @@ class UnityDataModule(LightningDataModule):
         # test dataset
         self.test_gait_dataset = whole_video_dataset(
             experiment=self._experiment,
-            dataset_idx=self._dataset_idx["val"],
+            dataset_idx=self._dataset_idx["test"],
             transform=self.mapping_transform,
         )
 
@@ -207,7 +207,7 @@ class UnityDataModule(LightningDataModule):
             self.train_gait_dataset,
             batch_size=self._batch_size,
             num_workers=self._num_workers,
-            pin_memory=True,  # 🚀 GPU内存传输加速（改自False）
+            pin_memory=False,
             shuffle=True,
             drop_last=True,
             collate_fn=self._collate_fn,
@@ -226,7 +226,7 @@ class UnityDataModule(LightningDataModule):
             self.val_gait_dataset,
             batch_size=self._batch_size,
             num_workers=self._num_workers,
-            pin_memory=True,  # 🚀 GPU内存传输加速（改自False）
+            pin_memory=False,  # 🚀 GPU内存传输加速（改自False）
             shuffle=False,
             drop_last=True,
             collate_fn=self._collate_fn,
@@ -245,7 +245,7 @@ class UnityDataModule(LightningDataModule):
             self.test_gait_dataset,
             batch_size=self._batch_size,
             num_workers=self._num_workers,
-            pin_memory=True,  # 🚀 GPU内存传输加速（改自False）
+            pin_memory=False,  # 🚀 GPU内存传输加速（改自False）
             shuffle=False,
             drop_last=True,
             collate_fn=self._collate_fn,

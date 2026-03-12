@@ -39,6 +39,7 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from project.dataloader.data_loader import UnityDataModule
+from project.map_config import UnityDataConfig
 
 #####################################
 # select different experiment trainer
@@ -49,9 +50,63 @@ from project.trainer.early.train_early_fusion import EarlyFusion3DCNNTrainer
 from project.trainer.late.train_late_fusion import LateFusion3DCNNTrainer
 from project.trainer.train_fusion_SSM import FusionSSMTrainer
 
-from project.map_config import UnityDataConfig
-
 logger = logging.getLogger(__name__)
+
+
+def load_fold_dataset_idx_from_fold_json(
+    config: DictConfig, fold: int
+) -> Dict[str, List[UnityDataConfig]]:
+    """加载指定fold的JSON文件
+
+    Args:
+        config: Hydra配置对象
+        fold: fold号 (0-4 for 5-fold, etc.)
+
+    Returns:
+        Dict[str, List[UnityDataConfig]]: {"train": [...], "val": [...], "test": [...]}
+    """
+
+    index_file_path = Path(str(config.data.index_mapping_path))
+
+    fold_file = index_file_path / f"fold_{fold:02d}.json"
+
+    with open(fold_file, "r", encoding="utf-8") as f:
+        fold_data = json.load(f)
+
+    fold_data.pop("_metadata", None)
+
+    dataset_idx: Dict[str, List[UnityDataConfig]] = {"train": [], "val": [], "test": []}
+
+    # 处理三种split
+    for split in ["train", "val", "test"]:
+        src_list = fold_data.get(split, [])
+
+        for item in src_list:
+            dataset_idx[split].append(
+                UnityDataConfig(
+                    person_id=item["person_id"],
+                    action_id=item["action_id"],
+                    cam1_id=item["cam1_id"],
+                    cam2_id=item["cam2_id"],
+                    cam1_path=Path(item["cam1_path"]),
+                    cam2_path=Path(item["cam2_path"]),
+                    label_path=Path(item["label_path"]),
+                    cam1_frames_dir=Path(item["cam1_frames_dir"]),
+                    cam2_frames_dir=Path(item["cam2_frames_dir"]),
+                    cam1_kpt2d_dir=Path(item["cam1_kpt2d_dir"]),
+                    cam2_kpt2d_dir=Path(item["cam2_kpt2d_dir"]),
+                    kpt3d_dir=Path(item["kpt3d_dir"]),
+                    sam3d_cam1_dir=Path(item["sam3d_cam1_dir"]),
+                    sam3d_cam2_dir=Path(item["sam3d_cam2_dir"]),
+                    sequence_meta_path=Path(item["sequence_meta_path"]),
+                    joint_names_path=Path(item["joint_names_path"]),
+                )
+            )
+
+    logger.info(
+        f"✓ Loaded fold {fold}: train={len(dataset_idx['train'])}, val={len(dataset_idx['val'])}, test={len(dataset_idx['test'])}"
+    )
+    return dataset_idx
 
 
 def load_fold_dataset_idx_from_index_mapping(config: DictConfig):
@@ -88,10 +143,14 @@ def load_fold_dataset_idx_from_index_mapping(config: DictConfig):
             raise ValueError(f"Fold {kfold} must be a dict, got {type(d)}")
 
         fold = int(kfold)
-        fold_dataset_idx[fold] = {"train": [], "val": []}
+        fold_dataset_idx[fold] = {"train": [], "val": [], "test": []}
 
-        # Accept both val/valid naming from different generators.
-        split_aliases = {"train": ["train"], "val": ["val", "valid"]}
+        # Accept both val/valid and test aliases from different generators.
+        split_aliases = {
+            "train": ["train"],
+            "val": ["val", "valid"],
+            "test": ["test", "eval", "holdout"],
+        }
 
         for split, aliases in split_aliases.items():
             src_list = None
@@ -100,9 +159,13 @@ def load_fold_dataset_idx_from_index_mapping(config: DictConfig):
                     src_list = d[alias]
                     break
             if src_list is None:
-                raise KeyError(
-                    f"Fold {kfold} missing split '{split}' (aliases: {aliases})"
-                )
+                # Backward compatibility: old index files may not have test split.
+                if split == "test" and "val" in d:
+                    src_list = d["val"]
+                else:
+                    raise KeyError(
+                        f"Fold {kfold} missing split '{split}' (aliases: {aliases})"
+                    )
             if not isinstance(src_list, list):
                 raise TypeError(
                     f"Fold {kfold} split '{split}' must be a list, got {type(src_list)}"
@@ -258,9 +321,9 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
             early_stopping,
             lr_monitor,
         ],
-        limit_train_batches=10,
-        limit_val_batches=10,
-        limit_test_batches=10,
+        # limit_train_batches=10,
+        # limit_val_batches=10,
+        # limit_test_batches=10,
     )
 
     trainer.fit(classification_module, data_module)
@@ -280,19 +343,19 @@ def train(hparams: DictConfig, dataset_idx, fold: int):
 )
 def init_params(config):
     # Load precomputed fold mapping only; do not prepare CV splits here.
-    fold_dataset_idx: Dict[int, Dict[str, List[UnityDataConfig]]] = (
-        load_fold_dataset_idx_from_index_mapping(config)
-    )
+    # 使用预生成的单fold JSON文件（每个fold文件必须存在）
 
     requested_fold = int(config.train.fold)
-    available_folds = sorted(fold_dataset_idx.keys())
+
+    # 检测可用的fold数量
+    available_folds = _detect_available_folds(config)
 
     # train.fold >= 0: run only the specified fold (recommended for multi-node jobs)
     # train.fold < 0: run all folds sequentially (backward compatible mode)
     if requested_fold >= 0:
-        if requested_fold not in fold_dataset_idx:
+        if requested_fold not in available_folds:
             raise KeyError(
-                f"Requested fold {requested_fold} is not in index mapping. "
+                f"Requested fold {requested_fold} is not available. "
                 f"Available folds: {available_folds}"
             )
         target_folds = [requested_fold]
@@ -313,7 +376,8 @@ def init_params(config):
     # * for one fold, we first train/val model, then save the best ckpt preds/label into .pt file.
 
     for fold in target_folds:
-        dataset_value = fold_dataset_idx[fold]
+        # 加载单个fold的JSON文件
+        dataset_value = load_fold_dataset_idx_from_fold_json(config, fold)
         logger.info("#" * 50)
         logger.info(f"Start train fold: {fold}")
         logger.info("#" * 50)
@@ -327,6 +391,23 @@ def init_params(config):
     logger.info("#" * 50)
     logger.info("finish train folds: %s", target_folds)
     logger.info("#" * 50)
+
+
+def _detect_available_folds(config: DictConfig) -> List[int]:
+    """检测可用的fold文件数量"""
+    index_file_path = Path(str(config.data.index_mapping_path))
+
+    # 查找所有fold_XX.json文件
+    fold_files = sorted(index_file_path.glob("fold_*.json"))
+
+    available_folds = []
+    for fold_file in fold_files:
+        # 从fold_00.json提取00并转为int
+        match = fold_file.stem.replace("fold_", "")
+        fold_num = int(match)
+        available_folds.append(fold_num)
+
+    return sorted(available_folds)
 
 
 if __name__ == "__main__":

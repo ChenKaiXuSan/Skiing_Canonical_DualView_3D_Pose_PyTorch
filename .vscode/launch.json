@@ -18,6 +18,7 @@
       "type": "debugpy",
       "request": "launch",
       "module": "project.main",
+      "python": "/opt/conda/envs/canonical_dualview_3d_pose/bin/python",
       "args": [
        "data.num_workers=12",
         "data.batch_size=16",

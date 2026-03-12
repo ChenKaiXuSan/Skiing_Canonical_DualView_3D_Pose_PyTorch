@@ -19,7 +19,7 @@ data:
     num_persons: 2
     num_actions: 12
     num_cameras: 108
-    strategies: [by_person, by_action]
+    strategies: [by_action]
     n_splits: 5
     force_recreate: false
 
@@ -31,12 +31,13 @@ data:
     sam_3d_body_results_path: ${data.root_path}/sam3d_body_results/inference # 有标签的训练数据
 
   index_mapping: ${data.root_path}/index_mapping # precomputed index mapping directory
-  index_mapping_file: camera_pairs_by_action.json # precomputed index mapping json file name
+  # index_mapping_file: camera_pairs_by_action.json # precomputed index mapping json file name
+  index_mapping_path: ${data.index_mapping}/camera_pairs_by_action_folds # precomputed index mapping json file path
 
   num_workers: 16
   img_size: 224
 
-  batch_size: 16
+  batch_size: 32
 
 model:
   backbone: 3dcnn # choices=[3dcnn, 2dcnn, cnn_lstm, two_stream], help='the backbone of the model'

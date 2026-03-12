@@ -6,6 +6,7 @@
 """
 
 import sys
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
@@ -16,6 +17,56 @@ from omegaconf import DictConfig, OmegaConf
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cross_validation.cross_validation_camera_pairs import CameraPairCrossValidation
+
+
+def _serialize_sample(sample: Any) -> Dict[str, Any]:
+    """Serialize a sample object to a JSON-friendly dict."""
+    if hasattr(sample, "to_dict") and callable(sample.to_dict):
+        return cast(Dict[str, Any], sample.to_dict())
+    if isinstance(sample, dict):
+        return sample
+    raise TypeError(f"Unsupported sample type for serialization: {type(sample)}")
+
+
+def _save_folds_separately(
+    folds: Dict[int, Dict[str, Any]],
+    strategy: str,
+    index_mapping_dir: Path,
+) -> List[Path]:
+    """Save each fold into an individual JSON file."""
+    fold_dir = index_mapping_dir / f"camera_pairs_{strategy}_folds"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_files: List[Path] = []
+    for fold_idx in sorted(folds.keys()):
+        fold_data = folds[fold_idx]
+
+        serialized_fold: Dict[str, Any] = {
+            "train": [_serialize_sample(s) for s in fold_data["train"]],
+            "val": [_serialize_sample(s) for s in fold_data["val"]],
+            "test": [_serialize_sample(s) for s in fold_data.get("test", [])],
+        }
+
+        for key, value in fold_data.items():
+            if key not in ["train", "val", "test"]:
+                serialized_fold[key] = value
+
+        serialized_fold["_metadata"] = {
+            "strategy": strategy,
+            "fold_idx": int(fold_idx),
+            "num_train": len(fold_data["train"]),
+            "num_val": len(fold_data["val"]),
+            "num_test": len(fold_data.get("test", [])),
+            "total": len(fold_data["train"]) + len(fold_data["val"]) + len(fold_data.get("test", [])),
+        }
+
+        fold_file = fold_dir / f"fold_{int(fold_idx):02d}.json"
+        with open(fold_file, "w", encoding="utf-8") as f:
+            json.dump(serialized_fold, f, ensure_ascii=False, indent=2)
+
+        saved_files.append(fold_file.resolve())
+
+    return saved_files
 
 
 def generate_index_files(
@@ -56,7 +107,7 @@ def generate_index_files(
     print(f"保存目录: {index_mapping_dir}")
     print("="*80 + "\n")
     
-    results: Dict[str, Dict[str, object]] = {}
+    results: Dict[str, Dict[str, Any]] = {}
     
     for strategy in strategies:
         print(f"\n{'='*60}")
@@ -76,17 +127,31 @@ def generate_index_files(
         
         # 生成并保存索引
         folds = cv(force_recreate=force_recreate)
+        fold_files = _save_folds_separately(
+            folds=folds,
+            strategy=strategy,
+            index_mapping_dir=index_mapping_dir,
+        )
         
         # 记录结果
+        strategy_index_file = (index_mapping_dir / f"camera_pairs_{strategy}.json").resolve()
+        strategy_fold_dir = (index_mapping_dir / f"camera_pairs_{strategy}_folds").resolve()
+
         results[strategy] = {
-            "file": str(index_mapping_dir / f"camera_pairs_{strategy}.json"),
+            "file": str(strategy_index_file),
+            "fold_dir": str(strategy_fold_dir),
+            "fold_files": fold_files,
             "n_folds": len(folds),
-            "total_samples": sum(len(fold["train"]) + len(fold["val"]) 
+            "total_samples": sum(len(fold["train"]) + len(fold["val"]) + len(fold.get("test", [])) 
                                 for fold in folds.values()) // len(folds)
         }
         
         print(f"\n✓ 策略 '{strategy}' 索引文件已生成")
         print(f"  文件路径: {results[strategy]['file']}")
+        print(f"  Fold目录: {results[strategy]['fold_dir']}")
+        print(f"  Fold文件数: {len(fold_files)}")
+        for fold_file in fold_files:
+            print(f"    - {fold_file}")
         print(f"  折数: {results[strategy]['n_folds']}")
         print(f"  每折样本数: {results[strategy]['total_samples']}")
     
@@ -96,8 +161,11 @@ def generate_index_files(
     print("="*80)
     
     for strategy, info in results.items():
+        fold_files_summary = cast(List[Path], info.get("fold_files", []))
         print(f"\n[{strategy}]")
         print(f"  文件: {info['file']}")
+        print(f"  Fold目录: {info['fold_dir']}")
+        print(f"  Fold文件数: {len(fold_files_summary)}")
         print(f"  折数: {info['n_folds']}")
         print(f"  样本数: {info['total_samples']:,}")
         
@@ -116,7 +184,7 @@ def generate_index_files(
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
-def hydra_main(cfg: DictConfig):
+def hydra_main(cfg: Optional[DictConfig] = None) -> None:
     """
     通过 Hydra 配置生成 index mapping。
 
@@ -124,6 +192,9 @@ def hydra_main(cfg: DictConfig):
     也支持命令行 override，例如：
     python cross_validation/generate_cv_index.py data.cross_validation.force_recreate=true
     """
+    if cfg is None:
+        raise ValueError("Hydra cfg is required")
+
     cv_cfg = cfg.data.cross_validation
 
     # 打印当前配置，便于排查。
@@ -140,10 +211,5 @@ def hydra_main(cfg: DictConfig):
         force_recreate=bool(cv_cfg.force_recreate),
     )
 
-
-def main() -> None:
-    cast(Any, hydra_main)()
-
-
 if __name__ == "__main__":
-    main()
+    cast(Any, hydra_main)()
